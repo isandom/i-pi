@@ -91,8 +91,12 @@ class SO3LR_driver(object):
         self._neighbors_in_axes = None
         self._system_in_axes = None
         
-        # GPU Topology Updater (optimization)
-        self._unified_model_jit = None  # Single unified dispatch (topology + model)
+        # GPU JIT Functions (optimization)
+        self._topology_jit = None       # Computes static inputs (indices, masks) - runs on rebuild only
+        self._model_jit = None          # Model execution (uses cached static inputs) - runs every step
+        
+        # Static Input Cache (optimization: avoid recomputing indices/masks every step)
+        self._cached_static_inputs = None  # Dict with safe_idx_i, safe_idx_j, edge_mask, etc.
 
         # State / Cache
         self._batched_neighbors = None
@@ -585,15 +589,68 @@ class SO3LR_driver(object):
 
 
 
-    def _create_unified_model_jit(self):
-        """Create UNIFIED JIT function: topology prep + cell inversion + model in ONE dispatch.
+    def _create_topology_jit(self):
+        """Create JIT function to compute STATIC inputs (indices, masks).
         
-        OPTIMIZATION: Consolidates 3 separate GPU dispatches into 1:
-        - Topology preparation (mask detection, index clamping)
-        - Batched cell inversion 
-        - Model execution
+        OPTIMIZATION: This runs ONLY on neighbor list rebuild.
+        Output is cached and reused until next rebuild.
         
-        This eliminates 2 Python dispatch round-trips, significantly improving GPU utilization.
+        Returns a function: (neighbors_batched) -> static_inputs_dict
+        """
+        dtype = self.dtype
+        n_atoms = self.n_atoms
+        
+        def detect_valid_edges(idx_i, idx_j):
+            """Detect valid edges (not padding, not self-loops) and return safe indices."""
+            valid_mask = (
+                (idx_i >= 0) & (idx_j >= 0) & 
+                (idx_i < n_atoms) & (idx_j < n_atoms) & 
+                (idx_i != idx_j)
+            )
+            safe_idx_i = jnp.where(valid_mask, idx_i, 0)
+            safe_idx_j = jnp.where(valid_mask, idx_j, 0)
+            return valid_mask, safe_idx_i, safe_idx_j
+        
+        def topology_single(neighbors):
+            """Compute static inputs for a single bead."""
+            idx_i = neighbors.centers
+            idx_j = neighbors.others
+            
+            valid_sr, safe_idx_i, safe_idx_j = detect_valid_edges(idx_i, idx_j)
+            edge_mask = valid_sr.astype(dtype)
+            
+            # Handle LR indices
+            idx_i_lr = getattr(neighbors, 'idx_i_lr', None)
+            idx_j_lr = getattr(neighbors, 'idx_j_lr', None)
+            
+            if idx_i_lr is None:
+                idx_i_lr = jnp.zeros((0,), dtype=jnp.int32)
+            if idx_j_lr is None:
+                idx_j_lr = jnp.zeros((0,), dtype=jnp.int32)
+            
+            valid_lr, safe_idx_i_lr, safe_idx_j_lr = detect_valid_edges(idx_i_lr, idx_j_lr)
+            edge_mask_lr = valid_lr.astype(dtype)
+            
+            return {
+                'safe_idx_i': safe_idx_i,
+                'safe_idx_j': safe_idx_j,
+                'edge_mask': edge_mask,
+                'valid_sr': valid_sr,
+                'safe_idx_i_lr': safe_idx_i_lr,
+                'safe_idx_j_lr': safe_idx_j_lr,
+                'edge_mask_lr': edge_mask_lr,
+                'valid_lr': valid_lr,
+            }
+        
+        return jax.jit(jax.vmap(topology_single, in_axes=(self._neighbors_in_axes,)))
+    
+    def _create_model_jit(self):
+        """Create JIT function for model execution using CACHED static inputs.
+        
+        OPTIMIZATION: Static inputs (indices, masks) are passed in, not recomputed.
+        This runs EVERY step but with minimal overhead.
+        
+        Returns a function: (static_inputs, positions, cells, atomic_numbers) -> (E, F, S)
         """
         dtype = self.dtype
         so3lr_calc = self.so3lr_calc
@@ -601,104 +658,46 @@ class SO3LR_driver(object):
         total_charge = self.total_charge
         num_unpaired_electrons = self.num_unpaired_electrons
         num_theory_levels = self.num_theory_levels
+        calculate_stress = self.calc_stress
         
-        # Constant for invalid/masked offsets (large value to ensure exclusion)
         INVALID_OFFSET = jnp.array([10000, 10000, 10000], dtype=jnp.int32)
         
-        # =====================================================================
-        # HELPER: Detect valid edges and compute safe indices
-        # =====================================================================
-        def detect_valid_edges(idx_i, idx_j):
-            """Detect valid edges (not padding, not self-loops) and return safe indices.
-            
-            Args:
-                idx_i: Center atom indices (may contain invalid values from padding)
-                idx_j: Neighbor atom indices
-                
-            Returns:
-                valid_mask: Boolean mask of valid edges
-                safe_idx_i: Indices clamped to valid range (invalid -> 0)
-                safe_idx_j: Indices clamped to valid range (invalid -> 0)
-            """
-            valid_mask = (
-                (idx_i >= 0) & (idx_j >= 0) & 
-                (idx_i < n_atoms) & (idx_j < n_atoms) & 
-                (idx_i != idx_j)
-            )
-            # Redirect invalid indices to 0 (creates self-loops for padding).
-            # This is safe: compute_offsets applies INVALID_OFFSET for these edges,
-            # resulting in d_ij >> cutoff, so they contribute zero energy.
-            safe_idx_i = jnp.where(valid_mask, idx_i, 0)
-            safe_idx_j = jnp.where(valid_mask, idx_j, 0)
-            return valid_mask, safe_idx_i, safe_idx_j
-        
-        # =====================================================================
-        # HELPER: Compute periodic cell offsets for minimum image convention
-        # =====================================================================
         def compute_offsets(positions, safe_idx_i, safe_idx_j, inv_cell, valid_mask):
-            """Compute integer cell offsets for periodic boundary conditions.
-            
-            Args:
-                positions: Atomic positions (n_atoms, 3)
-                safe_idx_i: Safe center indices
-                safe_idx_j: Safe neighbor indices
-                inv_cell: Inverse of cell matrix
-                valid_mask: Boolean mask of valid edges
-                
-            Returns:
-                offsets: Integer cell offsets (n_edges, 3), masked invalid -> INVALID_OFFSET
-            """
+            """Compute integer cell offsets."""
             r_i = positions[safe_idx_i]
             r_j = positions[safe_idx_j]
             disp_raw = r_j - r_i
-            # Cell is row-major (ASE convention): rows are lattice vectors a, b, c.
-            # For r = s @ H, fractional coords are: s = r @ H^-1 (no transpose needed)
             disp_frac = jnp.dot(disp_raw, inv_cell)
             offset = -jnp.round(disp_frac).astype(jnp.int32)
             return jnp.where(valid_mask[:, None], offset, INVALID_OFFSET)
         
-        # =====================================================================
-        # MAIN: Unified model function for single bead
-        # =====================================================================
-        def unified_model_single(system, neighbors):
-            """Complete pipeline for one bead: topology -> offsets -> model."""
+        def model_single(static_inputs, positions, cell, atomic_numbers):
+            """Execute model for a single bead using cached static inputs."""
+            # Unpack static inputs (NO recomputation!)
+            safe_idx_i = static_inputs['safe_idx_i']
+            safe_idx_j = static_inputs['safe_idx_j']
+            edge_mask = static_inputs['edge_mask']
+            valid_sr = static_inputs['valid_sr']
+            safe_idx_i_lr = static_inputs['safe_idx_i_lr']
+            safe_idx_j_lr = static_inputs['safe_idx_j_lr']
+            valid_lr = static_inputs['valid_lr']
             
-            # --- Step 1: Process SR edges ---
-            idx_i = neighbors.centers
-            idx_j = neighbors.others
-            n_edges = idx_i.shape[0]
+            # Deduce n_edges from array shape (static integer inside vmap)
+            n_edges = safe_idx_i.shape[0]
             
-            valid_sr, safe_idx_i, safe_idx_j = detect_valid_edges(idx_i, idx_j)
-            edge_mask = valid_sr.astype(dtype)
+            # Dynamic: Cell inversion
+            inv_cell = jnp.linalg.inv(cell)
             
-            # --- Step 2: Process LR edges SAFELY ---
-            # FIXED: Handle missing or None LR indices by normalizing to empty arrays.
-            # This prevents AttributeError when LR interactions are not configured.
-            idx_i_lr = getattr(neighbors, 'idx_i_lr', None)
-            idx_j_lr = getattr(neighbors, 'idx_j_lr', None)
+            # Dynamic: Compute offsets
+            final_offset = compute_offsets(positions, safe_idx_i, safe_idx_j, inv_cell, valid_sr)
+            final_offset_lr = compute_offsets(positions, safe_idx_i_lr, safe_idx_j_lr, inv_cell, valid_lr)
             
-            # Normalize None → empty arrays with shape (0,)
-            if idx_i_lr is None:
-                idx_i_lr = jnp.zeros((0,), dtype=jnp.int32)
-            if idx_j_lr is None:
-                idx_j_lr = jnp.zeros((0,), dtype=jnp.int32)
-                
-            n_edges_lr = idx_i_lr.shape[0]
-            
-            valid_lr, safe_idx_i_lr, safe_idx_j_lr = detect_valid_edges(idx_i_lr, idx_j_lr)
-            
-            # --- Step 3: Cell inversion (XLA optimizes within vmap) ---
-            inv_cell = jnp.linalg.inv(system.cell)
-            
-            # --- Step 4: Compute offsets ---
-            final_offset = compute_offsets(system.R, safe_idx_i, safe_idx_j, inv_cell, valid_sr)
-            
-            # --- Step 5: Build model inputs ---
+            # Build model inputs
             inputs = {
-                'positions': system.R,
-                'atomic_numbers': system.Z,
-                'cell': jnp.broadcast_to(system.cell[None, :, :], (n_edges, 3, 3)),
-                'cell_per_atom': jnp.broadcast_to(system.cell[None, :, :], (n_atoms, 3, 3)),
+                'positions': positions,
+                'atomic_numbers': atomic_numbers,
+                'cell': jnp.broadcast_to(cell[None, :, :], (n_edges, 3, 3)),
+                'cell_per_atom': jnp.broadcast_to(cell[None, :, :], (n_atoms, 3, 3)),
                 'idx_i': safe_idx_i,
                 'idx_j': safe_idx_j,
                 'cell_offset': final_offset,
@@ -708,81 +707,89 @@ class SO3LR_driver(object):
                 'num_unpaired_electrons': jnp.array([num_unpaired_electrons], dtype=dtype),
                 'theory_mask': jnp.ones((1, num_theory_levels), dtype=jnp.int32),
                 'batch_segments': jnp.zeros(n_atoms, dtype=jnp.int32),
-                'graph_mask': jnp.array([True])
+                'graph_mask': jnp.array([True]),
+                'idx_i_lr': safe_idx_i_lr,
+                'idx_j_lr': safe_idx_j_lr,
+                'cell_offset_lr': final_offset_lr,
             }
             
-            # --- Step 6: LR offsets ---
-            # NOTE: We unconditionally compute LR offsets (no Python if-statement).
-            # This is critical because Python conditionals inside JIT are evaluated at
-            # trace-time, not runtime, which would "bake in" the branch from the first call.
-            # 
-            # This approach is safe because:
-            # 1. Empty arrays (n_edges_lr=0): JAX handles them correctly, result is empty
-            # 2. Padded edges: valid_lr=False → INVALID_OFFSET → d_ij >> cutoff → 0 contribution
-            final_offset_lr = compute_offsets(system.R, safe_idx_i_lr, safe_idx_j_lr, inv_cell, valid_lr)
-            inputs['idx_i_lr'] = safe_idx_i_lr
-            inputs['idx_j_lr'] = safe_idx_j_lr
-            inputs['cell_offset_lr'] = final_offset_lr
+            # Run model
+            output = so3lr_calc(inputs)
             
-            # --- Step 7: Run model ---
-            return so3lr_calc(inputs)
+            # Unit conversion on GPU
+            energy_hartree = output['energy'] * EV_TO_HARTREE
+            forces_hartree_bohr = output['forces'] * (EV_TO_HARTREE * BOHR_TO_ANG)
+            
+            # Stress: eV/Ang^3 -> Hartree/Bohr^3 + Voigt
+            # GATE: Only compute if requested (allows XLA DCE to remove the calculation if unused)
+            if calculate_stress and 'stress' in output:
+                stress_raw = output['stress'] # (1, 6) or (1, 3, 3)
+                # Squeeze batch dim if present (usually (1, ...))
+                stress_squeezed = jnp.squeeze(stress_raw, axis=0)
+                
+                if stress_squeezed.shape == (6,):
+                    s = stress_squeezed
+                    stress_full = jnp.array([
+                        [s[0], s[5], s[4]],
+                        [s[5], s[1], s[3]],
+                        [s[4], s[3], s[2]]
+                    ])
+                elif stress_squeezed.shape == (3, 3):
+                    stress_full = stress_squeezed
+                else:
+                    stress_full = jnp.zeros((3, 3), dtype=dtype)
+                
+                stress_conv_factor = EV_TO_HARTREE * (BOHR_TO_ANG ** 3)
+                stress_hartree_bohr = stress_full * stress_conv_factor
+            else:
+                stress_hartree_bohr = jnp.zeros((3, 3), dtype=dtype)
+            
+            return energy_hartree, forces_hartree_bohr, stress_hartree_bohr
         
-        # in_axes: system batched, neighbors batched
-        return jax.jit(jax.vmap(unified_model_single, in_axes=(self._system_in_axes, self._neighbors_in_axes)))
+        # in_axes: static_inputs dict batched, positions batched, cells batched, Z batched
+        static_in_axes = {k: 0 for k in ['safe_idx_i', 'safe_idx_j', 'edge_mask', 'valid_sr',
+                                          'safe_idx_i_lr', 'safe_idx_j_lr', 'edge_mask_lr', 'valid_lr']}
+        return jax.jit(jax.vmap(model_single, in_axes=(static_in_axes, 0, 0, 0)))
 
-    def _run_vmapped_calculation(self, batched_system, batched_neighbors, n_batch):
-        """Execute vmapped calculation with UNIFIED GPU dispatch.
+    def _run_vmapped_calculation(self, batched_system, batched_neighbors, n_batch, needs_rebuild=False):
+        """Execute vmapped calculation with SPLIT JIT architecture.
         
-        OPTIMIZED: Single JIT function handles topology prep + cell inversion + model.
-        Eliminates 2 Python dispatch round-trips compared to previous 3-call design.
+        OPTIMIZED: 
+        - Topology JIT (static inputs) runs ONLY on rebuild.
+        - Model JIT (dynamic inputs) runs EVERY step using cached static inputs.
         """
         
-        # Lazy initialization of unified JIT function
-        if self._unified_model_jit is None:
-            self._unified_model_jit = self._create_unified_model_jit()
+        # Lazy initialization of JIT functions
+        if self._topology_jit is None:
+            self._topology_jit = self._create_topology_jit()
+        if self._model_jit is None:
+            self._model_jit = self._create_model_jit()
         
         # =====================================================================
-        # SINGLE GPU DISPATCH: Topology + Inversion + Model all in one call
+        # STATIC INPUT CACHING (Topology JIT runs only on rebuild)
         # =====================================================================
-        output_batched = self._unified_model_jit(batched_system, batched_neighbors)
+        if needs_rebuild or self._cached_static_inputs is None:
+            # Compute static inputs (indices, masks) - runs topology_jit
+            self._cached_static_inputs = self._topology_jit(batched_neighbors)
         
-        # Transfer ALL results to CPU in SINGLE device_get call (no separate block_until_ready needed)
-        # device_get already blocks until computation is complete
-        has_stress = 'stress' in output_batched
-        if has_stress:
-            energies_ev, forces_ev_ang, stresses_raw = jax.device_get(
-                (output_batched['energy'], output_batched['forces'], output_batched['stress'])
-            )
-        else:
-            energies_ev, forces_ev_ang = jax.device_get(
-                (output_batched['energy'], output_batched['forces'])
-            )
+        # =====================================================================
+        # MODEL EXECUTION (uses cached static inputs)
+        # =====================================================================
+        energies_batched, forces_batched, stresses_batched = self._model_jit(
+            self._cached_static_inputs,
+            batched_system.R,           # Positions (dynamic)
+            batched_system.cell,        # Cells (dynamic)
+            batched_system.Z            # Atomic numbers (static but passed through)
+        )
         
-        # Vectorized unit conversion (fast numpy ops)
-        energies_hartree = np.asarray(energies_ev) * EV_TO_HARTREE
-        forces_hartree_bohr = np.asarray(forces_ev_ang) * (EV_TO_HARTREE * BOHR_TO_ANG)
-
-        # Stress handling (optimized: no second device_get)
-        if has_stress:
-            stresses_raw = np.asarray(stresses_raw)
-            if stresses_raw.shape[-1] == 6:
-                # Vectorized Voigt to full tensor conversion
-                stresses = np.zeros((n_batch, 3, 3), dtype=stresses_raw.dtype)
-                stresses[:, 0, 0] = stresses_raw[:, 0]
-                stresses[:, 1, 1] = stresses_raw[:, 1]
-                stresses[:, 2, 2] = stresses_raw[:, 2]
-                stresses[:, 1, 2] = stresses[:, 2, 1] = stresses_raw[:, 3]
-                stresses[:, 0, 2] = stresses[:, 2, 0] = stresses_raw[:, 4]
-                stresses[:, 0, 1] = stresses[:, 1, 0] = stresses_raw[:, 5]
-            else:
-                stresses = stresses_raw
-            stresses = stresses * EV_TO_HARTREE * (BOHR_TO_ANG ** 3)
-        else:
-            stresses = self._zero_stresses  # Pre-allocated
-
-        # Package results using pre-cached empty JSON
+        # Transfer results to CPU
+        energies_k, forces_k, stresses_k = jax.device_get(
+            (energies_batched, forces_batched, stresses_batched)
+        )
+        
+        # Package results
         result_list = [
-            (float(energies_hartree[i]), forces_hartree_bohr[i].ravel(), stresses[i], self._empty_json)
+            (float(energies_k[i]), forces_k[i].ravel(), stresses_k[i], self._empty_json)
             for i in range(n_batch)
         ]
 
@@ -857,12 +864,15 @@ class SO3LR_driver(object):
         # 6. Use batched neighbors directly (already stored in _batched_neighbors by _update_neighbor_lists)
         # OPTIMIZED: Skip _prepare_batched_neighbors overhead
         batched_neighbors = self._batched_neighbors
+        
+        # Determine if static inputs need refresh (rebuild occurred)
+        needs_rebuild = not can_reuse_cache
 
         if diagnostics and can_reuse_cache:
             print("[SO3LR] ✓ Fast Path: Reusing cached static inputs")
 
-        # 7. Execute with GPU topology update
-        results = self._run_vmapped_calculation(batched_system, batched_neighbors, n_batch)
+        # 7. Execute with split JIT (topology cached, model runs every step)
+        results = self._run_vmapped_calculation(batched_system, batched_neighbors, n_batch, needs_rebuild=needs_rebuild)
 
         if diagnostics:
             t_total = time.time() - start
