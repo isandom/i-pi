@@ -163,7 +163,10 @@ class SO3LR_driver(object):
         self.cutoff = float(self.kwargs.get('cutoff', 4.5))
         dtype_str = self.kwargs.get('dtype', 'float32')
         self.dtype = np.float32 if dtype_str == 'float32' else np.float64
-        self.calc_stress = self.kwargs.get('calculate_stress', False)
+        # NOTE: Stress calculation is NOT yet supported by the So3lr wrapper.
+        # The model only computes energy and forces. NPT simulations will receive zeros.
+        # See PROJECT_CONTEXT.md Section 9 for details and future implementation plans.
+        self.calc_stress = False  # Disabled until So3lr supports strain-gradient method
         self.damping = float(self.kwargs.get('dispersion_energy_cutoff_lr_damping', 2.0))
         self.total_charge = float(self.kwargs.get('total_charge', 0.0))
         self.num_unpaired_electrons = float(self.kwargs.get('num_unpaired_electrons', 0.0))
@@ -721,7 +724,8 @@ class SO3LR_driver(object):
             forces_hartree_bohr = output['forces'] * (EV_TO_HARTREE * BOHR_TO_ANG)
             
             # Stress: eV/Ang^3 -> Hartree/Bohr^3 + Voigt
-            # GATE: Only compute if requested (allows XLA DCE to remove the calculation if unused)
+            # NOTE: This block is prepared for future NPT support. Currently, So3lr
+            # never outputs 'stress', so we always return zeros. See calc_stress comment above.
             if calculate_stress and 'stress' in output:
                 stress_raw = output['stress'] # (1, 6) or (1, 3, 3)
                 # Squeeze batch dim if present (usually (1, ...))
