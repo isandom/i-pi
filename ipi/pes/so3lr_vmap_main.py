@@ -149,8 +149,15 @@ class SO3LR_driver(object):
         import jax.numpy as jnp
 
         from glp import System, atoms_to_system
+        from glp.periodic import displacement
+        from glp.utils import squared_distance
         from so3lr import So3lr
         import so3lr as so3lr_pkg
+        
+        # Store GLP distance functions for skin violation check (Option C)
+        # These are the EXACT same functions GLP uses internally in need_update_fn
+        self._glp_displacement = displacement
+        self._glp_squared_distance = squared_distance
 
         if self.verbose:
             print(f"[SO3LR] JAX devices: {jax.devices()}")
@@ -186,8 +193,9 @@ class SO3LR_driver(object):
         # See PROJECT_CONTEXT.md Section 9 for details and future implementation plans.
         self.calc_stress = False  # Disabled until So3lr supports strain-gradient method
         self.damping = float(self.kwargs.get('dispersion_energy_cutoff_lr_damping', 2.0))
-        self.total_charge = float(self.kwargs.get('total_charge', 0.0))
-        self.num_unpaired_electrons = float(self.kwargs.get('num_unpaired_electrons', 0.0))
+        # FIX: Use int16 dtype for total_charge/num_unpaired_electrons (matches mlff dataloader)
+        self.total_charge = int(self.kwargs.get('total_charge', 0))
+        self.num_unpaired_electrons = int(self.kwargs.get('num_unpaired_electrons', 0))
 
         # Neighbor list parameters
         self.skin = float(self.kwargs.get('skin', 1.0))
@@ -210,11 +218,20 @@ class SO3LR_driver(object):
             lr_cutoff=self.lr_cutoff
         )
 
-        # num_theory_levels: Required for theory_mask shape
-        # Default to 16 (standard SO3LR model), override via kwargs if different
+        # Theory level configuration (for multi-theory-level models)
+        # num_theory_levels: Total number of theory levels (default 16 for SO3LR)
+        # theory_level: Which theory level to use (default 1, matching jraph drivers)
         self.num_theory_levels = int(self.kwargs.get('num_theory_levels', 16))
+        self.theory_level = int(self.kwargs.get('theory_level', 1))
+        
+        # FIX: Pre-compute theory_mask as ONE-HOT float32 (not ones int32!)
+        # The mlff model uses theory_mask to SELECT per-theory-level parameters.
+        # Using jnp.ones would incorrectly sum across ALL theory levels.
+        # One-hot encoding: shape (1, num_theory_levels), dtype float32
+        self._theory_mask_const = jnp.eye(self.num_theory_levels, dtype=jnp.float32)[self.theory_level:self.theory_level+1]
+        
         if self.verbose:
-            print(f"[SO3LR] Using num_theory_levels: {self.num_theory_levels}")
+            print(f"[SO3LR] Using theory_level={self.theory_level}, num_theory_levels={self.num_theory_levels}")
 
         if self.verbose:
             print("[SO3LR] ✓ Initialized So3lr (GLP neighbor lists will be set up on first compute)")
@@ -310,6 +327,17 @@ class SO3LR_driver(object):
                     idx_i_lr=jnp.zeros((target_lr_capacity,), dtype=jnp.int32),
                     idx_j_lr=jnp.zeros((target_lr_capacity,), dtype=jnp.int32)
                 )
+        
+        # CRITICAL FIX: Reset overflow flag after padding to prevent false overflow detection
+        # GLP's update_fn checks if new neighbors fit in capacity, but uses internal capacity field.
+        # After padding, we have more space, so overflow should be False.
+        # NOTE: Use jnp.array(False) not Python False - Python bool lacks .ndim so gets stacked incorrectly
+        if hasattr(padded, 'overflow'):
+            padded = padded._replace(overflow=jnp.array(False))
+        
+        # Update capacity field if present (GLP stores this internally)
+        if hasattr(padded, 'capacity'):
+            padded = padded._replace(capacity=target_capacity)
         
         return padded
 
@@ -486,20 +514,33 @@ class SO3LR_driver(object):
         # Create vmapped NL update if needed
         if self._vmapped_nl_update_fn is None:
             self._neighbors_in_axes = self._compute_in_axes_for_neighbors(prev_neighbors_batched)
-            skin_threshold = self.skin / 2.0
+            # GLP's exact threshold: (skin * 0.5) ** 2 (squared, for comparison with squared distance)
+            skin_threshold_sq = (self.skin * 0.5) ** 2
+            
+            # Capture GLP distance functions for use in closure
+            glp_displacement = self._glp_displacement
+            glp_squared_distance = self._glp_squared_distance
 
             def nl_update_single(pos, nbrs, cell):
-                # Check skin violation: atoms moved too far from reference positions
+                # Check skin violation using GLP's EXACT PBC minimum-image distance metric.
+                # This matches GLP's internal need_update_fn to ensure our detection is
+                # perfectly synchronized with when GLP actually recomputes neighbor indices.
+                #
+                # GLP uses: make_squared_distance(cell) = vmap(squared_distance(displacement(cell, Ra, Rb)))
+                # We replicate this exactly to avoid any discrepancy between our check and GLP's.
                 ref_pos = nbrs.reference_positions
-                max_displacement = jnp.max(jnp.linalg.norm(pos - ref_pos, axis=-1))
-                skin_violation = max_displacement > skin_threshold
                 
-                # FIX: Call GLP's update_fn to ensure internal state (like reference_positions) 
+                # Compute PBC minimum-image squared displacement per atom
+                # displacement(cell, Ra, Rb) wraps to [-0.5, 0.5) in fractional coords
+                pbc_disp_sq = jax.vmap(
+                    lambda ra, rb: glp_squared_distance(glp_displacement(cell, ra, rb))
+                )(ref_pos, pos)
+                
+                max_movement_sq = jnp.max(pbc_disp_sq)
+                skin_violation = max_movement_sq > skin_threshold_sq
+                
+                # Call GLP's update_fn to ensure internal state (like reference_positions) 
                 # is properly managed and valid updates are performed.
-                # Previous versions avoided this due to concerns about vmap(cond), but 
-                # JAX handles scalar predicates inside vmap correctly.
-                # Skipping this caused "Ghost Updates" where the neighbor list logic was 
-                # completely bypassed until a manual skin violation check forced a rebuild.
                 updated_nbrs = self._update_neighbors_fn(pos, nbrs, new_cell=cell)
 
                 return updated_nbrs, skin_violation
@@ -517,6 +558,17 @@ class SO3LR_driver(object):
         # Check overflow and skin violations (single sync point for both)
         overflow_flags = getattr(updated_neighbors_batched, "overflow", None)
         
+        # WARNING: GLP has a bug where skin is effectively counted twice in cell_too_small check.
+        # The check uses: 2 * (cutoff + skin) > cell_size, but cutoff is already cutoff + skin
+        # at runtime due to closure capture, so the effective check is:
+        #     2 * (cutoff + 2*skin) > cell_size
+        #
+        # CORRECT FORMULA for maximum skin:
+        #     skin_max = (cell_min_dimension / 2 - cutoff) / 2
+        #
+        # Example: cell=56 Å, lr_cutoff=12 Å → skin_max = (56/2 - 12) / 2 = 8 Å
+        # Using skin > 8 Å will trigger cell_too_small → overflow = True every step
+        
         # Sync both at once to minimize CPU-GPU transfers
         if overflow_flags is not None:
             any_overflow, any_skin_violation = jax.device_get(
@@ -532,15 +584,21 @@ class SO3LR_driver(object):
 
         # Handle overflow or skin violation: need to rebuild neighbor list (full search)
         if needs_rebuild:
-            if diagnostics:
-                reason = "overflow" if any_overflow else "skin violation"
-                print(f"[SO3LR] ⚠️ {reason.capitalize()} detected, rebuilding neighbor lists")
+            reason_parts = []
+            if any_overflow:
+                reason_parts.append("OVERFLOW")
+            if any_skin_violation:
+                reason_parts.append("SKIN_VIOLATION")
+            reason = " + ".join(reason_parts)
+            print(f"[SO3LR] ⚠️ Rebuild triggered by: {reason}")
+            print(f"[SO3LR]    Capacities: SR={self._max_neighbor_capacity_seen}, LR={self._max_neighbor_lr_capacity_seen}")
             
             # Must go to CPU for rebuild (full neighbor search)
             neighbors_list = self._unstack_pytree(updated_neighbors_batched, n_batch)
             overflow_np = np.asarray(overflow_flags) if overflow_flags is not None else np.zeros(n_batch, dtype=bool)
             skin_np = np.asarray(skin_violations)
             
+
             # NOTE: We must rebuild per-bead in a Python loop because GLP's allocate_fn
             # cannot be vmapped (ConcretizationTypeError due to .item() calls).
             # A vmapped rebuild-all-beads would be faster but is not possible.
@@ -567,9 +625,45 @@ class SO3LR_driver(object):
             if lr_caps:
                 max_lr_cap = max(lr_caps)
             
-            # Update capacity tracking with buffer
-            self._max_neighbor_capacity_seen = max(self._max_neighbor_capacity_seen, int(max_sr_cap * 1.25))
-            self._max_neighbor_lr_capacity_seen = max(self._max_neighbor_lr_capacity_seen, int(max_lr_cap * 1.25))
+            # Track old capacities to detect shape changes
+            old_sr_cap = self._max_neighbor_capacity_seen
+            old_lr_cap = self._max_neighbor_lr_capacity_seen
+            
+            # FIX: Only grow capacity on OVERFLOW, not on SKIN_VIOLATION
+            # For skin-only rebuilds, keep existing capacity to prevent shape changes → OOM
+            
+            # Use CAPACITY BUCKETS to prevent frequent small shape changes
+            # Round up to nearest bucket size (500 for SR, 1000 for LR)
+            SR_BUCKET = 500
+            LR_BUCKET = 1000
+            
+            def round_up_to_bucket(value, bucket_size):
+                """Round up value to nearest bucket, with 25% buffer."""
+                buffered = int(value * 1.25)
+                return ((buffered + bucket_size - 1) // bucket_size) * bucket_size
+            
+            if any_overflow:
+                # Real overflow: grow to next bucket with buffer
+                new_sr = round_up_to_bucket(max_sr_cap, SR_BUCKET)
+                new_lr = round_up_to_bucket(max_lr_cap, LR_BUCKET)
+
+                self._max_neighbor_capacity_seen = max(self._max_neighbor_capacity_seen, new_sr)
+                self._max_neighbor_lr_capacity_seen = max(self._max_neighbor_lr_capacity_seen, new_lr)
+            else:
+                # Skin violation only: only grow if truly needed
+                if max_sr_cap > self._max_neighbor_capacity_seen:
+                    self._max_neighbor_capacity_seen = round_up_to_bucket(max_sr_cap, SR_BUCKET)
+                if max_lr_cap > self._max_neighbor_lr_capacity_seen:
+                    self._max_neighbor_lr_capacity_seen = round_up_to_bucket(max_lr_cap, LR_BUCKET)
+            
+            # If shapes changed, CLEAR JIT caches to prevent OOM from accumulated compilations
+            # This forces recompilation but prevents memory leak from old compiled functions
+            if self._max_neighbor_capacity_seen != old_sr_cap or self._max_neighbor_lr_capacity_seen != old_lr_cap:
+                self._topology_jit = None
+                self._model_jit = None
+                self._cached_static_inputs = None
+                if self.verbose:
+                    print(f"[SO3LR] Shapes changed (SR: {old_sr_cap}→{self._max_neighbor_capacity_seen}, LR: {old_lr_cap}→{self._max_neighbor_lr_capacity_seen}), clearing JIT cache")
             
             # Pad ALL neighbor lists to the same capacity before stacking
             for i in range(len(neighbors_list)):
@@ -660,12 +754,28 @@ class SO3LR_driver(object):
         dtype = self.dtype
         so3lr_calc = self.so3lr_calc
         n_atoms = self.n_atoms
-        total_charge = self.total_charge
-        num_unpaired_electrons = self.num_unpaired_electrons
-        num_theory_levels = self.num_theory_levels
+        total_charge = self.total_charge  # int
+        num_unpaired_electrons = self.num_unpaired_electrons  # int
+        theory_mask_const = self._theory_mask_const  # float32 one-hot (1, num_theory_levels)
         calculate_stress = self.calc_stress
         
+        # INVALID_OFFSET: Large offset to push padded SR edges far away.
+        # 
+        # HOW IT WORKS (SR only):
+        # - Invalid SR edges get offset [10000, 10000, 10000]
+        # - This produces r_ij ≈ 300,000 Å after PBC wrapping (10000 * cell_size)
+        # - cutoff_fn(300,000) → 0.0 (cutoff is ~4.5 Å)
+        # - edge_mask (patched mlff) multiplies cutoff → double-zeroed
+        #
+        # NOTE: This does NOT affect LR edges!
+        # - mlff IGNORES cell_offset_lr due to shape mismatch (n_edges_sr vs n_edges_lr)
+        # - LR invalid edges are handled via: edge_mask_lr applied to final energy
+        # 
+        # REQUIRES: mlff branch feat/full-sparse-padding-support
         INVALID_OFFSET = jnp.array([10000, 10000, 10000], dtype=jnp.int32)
+        # LR edges use zero offset for invalid entries (not INVALID_OFFSET)
+        # because large offsets × cell produce distances that overflow R^10 in dispersion backward pass
+        ZERO_OFFSET = jnp.array([0, 0, 0], dtype=jnp.int32)
         
         def compute_offsets(positions, safe_idx_i, safe_idx_j, cell, valid_mask):
             """Compute integer cell offsets.
@@ -682,6 +792,25 @@ class SO3LR_driver(object):
             offset = -jnp.round(disp_frac).astype(jnp.int32)
             return jnp.where(valid_mask[:, None], offset, INVALID_OFFSET)
         
+        def compute_offsets_lr(positions, safe_idx_i, safe_idx_j, cell, valid_mask):
+            """Compute integer cell offsets for LR edges.
+            
+            DIFFERENCE FROM SR: Invalid LR edges get ZERO offset, not INVALID_OFFSET.
+            This is critical because:
+            - SR: Large distances are filtered by cutoff_fn → safe
+            - LR: Distances go directly to vdw_QDO_disp_damp which computes R^10
+            - If R > ~1000 Å, R^10 overflows float32 in backward pass → NaN
+            
+            With ZERO offset, invalid LR edges have d_ij from atom 0 self-loop (~0),
+            then safe_norm placeholder gives d_ij_lr=1000 (Å), which is safe.
+            """
+            r_i = positions[safe_idx_i]
+            r_j = positions[safe_idx_j]
+            disp_raw = r_j - r_i
+            disp_frac = jnp.linalg.solve(cell.T, disp_raw.T).T
+            offset = -jnp.round(disp_frac).astype(jnp.int32)
+            return jnp.where(valid_mask[:, None], offset, ZERO_OFFSET)
+        
         def model_single(static_inputs, positions, cell, atomic_numbers):
             """Execute model for a single bead using cached static inputs."""
             # Unpack static inputs (NO recomputation!)
@@ -691,16 +820,21 @@ class SO3LR_driver(object):
             valid_sr = static_inputs['valid_sr']
             safe_idx_i_lr = static_inputs['safe_idx_i_lr']
             safe_idx_j_lr = static_inputs['safe_idx_j_lr']
+            edge_mask_lr = static_inputs['edge_mask_lr']
             valid_lr = static_inputs['valid_lr']
             
             # Deduce n_edges from array shape (static integer inside vmap)
             n_edges = safe_idx_i.shape[0]
+            n_edges_lr = safe_idx_i_lr.shape[0]  # LR edge count for cell_lr broadcast
             
-            # Dynamic: Compute offsets (uses solve instead of explicit inverse)
+            # Dynamic: Compute cell offsets for PBC (used by model's internal displacement calculation)
             final_offset = compute_offsets(positions, safe_idx_i, safe_idx_j, cell, valid_sr)
-            final_offset_lr = compute_offsets(positions, safe_idx_i_lr, safe_idx_j_lr, cell, valid_lr)
+            final_offset_lr = compute_offsets_lr(positions, safe_idx_i_lr, safe_idx_j_lr, cell, valid_lr)
             
-            # Build model inputs
+            # NOTE: Model uses input_convention='positions' (default from load_model_from_workdir)
+            # so it computes displacements internally from positions + cell_offset.
+            # We don't need to pass 'displacements' - only 'positions' and 'cell_offset'.
+
             inputs = {
                 'positions': positions,
                 'atomic_numbers': atomic_numbers,
@@ -711,15 +845,19 @@ class SO3LR_driver(object):
                 'cell_offset': final_offset,
                 'node_mask': jnp.ones((n_atoms,), dtype=dtype),
                 'edge_mask': edge_mask,
-                'total_charge': jnp.array([total_charge], dtype=dtype),
-                'num_unpaired_electrons': jnp.array([num_unpaired_electrons], dtype=dtype),
-                'theory_mask': jnp.ones((1, num_theory_levels), dtype=jnp.int32),
+                # FIX: Use int16 for charge/spin (matches mlff dataloader), one-hot float32 for theory_mask
+                'total_charge': jnp.array([total_charge], dtype=jnp.int16),
+                'num_unpaired_electrons': jnp.array([num_unpaired_electrons], dtype=jnp.int16),
+                'theory_mask': theory_mask_const,  # Pre-computed one-hot float32
                 'batch_segments': jnp.zeros(n_atoms, dtype=jnp.int32),
                 'graph_mask': jnp.array([True]),
                 'idx_i_lr': safe_idx_i_lr,
                 'idx_j_lr': safe_idx_j_lr,
                 'cell_offset_lr': final_offset_lr,
+                'cell_lr': jnp.broadcast_to(cell[None, :, :], (n_edges_lr, 3, 3)),  # LR cell for PBC
+                'edge_mask_lr': edge_mask_lr,
             }
+
             
             # Run model
             output = so3lr_calc(inputs)
