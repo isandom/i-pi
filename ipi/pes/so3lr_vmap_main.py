@@ -310,12 +310,16 @@ class SO3LR_driver(object):
                 # LR field: pad to LR capacity
                 if target_lr_capacity is not None and arr.shape[0] < target_lr_capacity:
                     pad_width = [(0, target_lr_capacity - arr.shape[0])] + [(0, 0)] * (arr.ndim - 1)
-                    return jnp.pad(arr, pad_width, mode='constant', constant_values=0)
+                    # FIX: Pad with n_atoms (invalid index) instead of 0 (valid atom 0)
+                    fill_value = self.n_atoms
+                    return jnp.pad(arr, pad_width, mode='constant', constant_values=fill_value)
             else:
                 # SR field: pad to SR capacity
                 if arr.shape[0] < target_capacity:
                     pad_width = [(0, target_capacity - arr.shape[0])] + [(0, 0)] * (arr.ndim - 1)
-                    return jnp.pad(arr, pad_width, mode='constant', constant_values=0)
+                    # FIX: Pad with n_atoms (invalid index) instead of 0 (valid atom 0)
+                    fill_value = self.n_atoms
+                    return jnp.pad(arr, pad_width, mode='constant', constant_values=fill_value)
             return arr
 
         padded = jax.tree_util.tree_map_with_path(pad_leaf_with_path, neighbors)
@@ -780,15 +784,19 @@ class SO3LR_driver(object):
         def compute_offsets(positions, safe_idx_i, safe_idx_j, cell, valid_mask):
             """Compute integer cell offsets.
             
-            OPTIMIZATION: Use solve(cell.T, disp_raw.T).T instead of dot(disp_raw, inv(cell)).
-            This avoids explicit inverse formation, which is more numerically stable
-            and typically generates better GPU kernels.
+            Uses explicit inversion to match GLP reference logic exactly.
+            disp_frac = (r_j - r_i) @ inv(cell)
+            offset = -round(disp_frac)
             """
             r_i = positions[safe_idx_i]
             r_j = positions[safe_idx_j]
             disp_raw = r_j - r_i
-            # disp_frac = disp_raw @ inv(cell) is equivalent to solving: cell.T @ disp_frac.T = disp_raw.T
-            disp_frac = jnp.linalg.solve(cell.T, disp_raw.T).T
+            
+            # Use inv(cell) for consistency with Reference/GLP
+            # cell is (3,3) in ASE convention (rows)
+            inv_cell = jnp.linalg.inv(cell)
+            disp_frac = jnp.dot(disp_raw, inv_cell)
+            
             offset = -jnp.round(disp_frac).astype(jnp.int32)
             return jnp.where(valid_mask[:, None], offset, INVALID_OFFSET)
         
@@ -796,18 +804,15 @@ class SO3LR_driver(object):
             """Compute integer cell offsets for LR edges.
             
             DIFFERENCE FROM SR: Invalid LR edges get ZERO offset, not INVALID_OFFSET.
-            This is critical because:
-            - SR: Large distances are filtered by cutoff_fn → safe
-            - LR: Distances go directly to vdw_QDO_disp_damp which computes R^10
-            - If R > ~1000 Å, R^10 overflows float32 in backward pass → NaN
-            
-            With ZERO offset, invalid LR edges have d_ij from atom 0 self-loop (~0),
-            then safe_norm placeholder gives d_ij_lr=1000 (Å), which is safe.
+            matches Reference/GLP logic using explicit inverse.
             """
             r_i = positions[safe_idx_i]
             r_j = positions[safe_idx_j]
             disp_raw = r_j - r_i
-            disp_frac = jnp.linalg.solve(cell.T, disp_raw.T).T
+            
+            inv_cell = jnp.linalg.inv(cell)
+            disp_frac = jnp.dot(disp_raw, inv_cell)
+            
             offset = -jnp.round(disp_frac).astype(jnp.int32)
             return jnp.where(valid_mask[:, None], offset, ZERO_OFFSET)
         
