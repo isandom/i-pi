@@ -796,7 +796,7 @@ class SO3LR_driver(object):
         OPTIMIZATION: Static inputs (indices, masks) are passed in, not recomputed.
         This runs EVERY step but with minimal overhead.
         
-        Returns a function: (static_inputs, positions, cells, atomic_numbers) -> (E, F, S)
+        Returns a function: (static_inputs, positions, cells) -> (E, F, S)
         """
         dtype = self.dtype
         so3lr_calc = self.so3lr_calc
@@ -805,6 +805,7 @@ class SO3LR_driver(object):
         num_unpaired_electrons = self.num_unpaired_electrons  # int
         theory_mask_const = self._theory_mask_const  # float32 one-hot (1, num_theory_levels)
         calculate_stress = self.calc_stress
+        atomic_numbers_const = jnp.array(self.atomic_numbers, dtype=jnp.int32)
         
         # INVALID_OFFSET: Large offset to push padded SR edges far away.
         # 
@@ -824,43 +825,28 @@ class SO3LR_driver(object):
         # because large offsets × cell produce distances that overflow R^10 in dispersion backward pass
         ZERO_OFFSET = jnp.array([0, 0, 0], dtype=jnp.int32)
         
-        def compute_offsets(positions, safe_idx_i, safe_idx_j, cell, valid_mask):
-            """Compute integer cell offsets.
+        def compute_offsets(positions, safe_idx_i, safe_idx_j, inv_cell, valid_mask, invalid_offset):
+            """Compute integer cell offsets for SR or LR edges.
             
-            Uses explicit inversion to match GLP reference logic exactly.
-            disp_frac = (r_j - r_i) @ inv(cell)
+            Uses pre-computed inv(cell) to avoid redundant inversion.
+            disp_frac = (r_j - r_i) @ inv_cell
             offset = -round(disp_frac)
+            
+            Args:
+                inv_cell: Pre-computed jnp.linalg.inv(cell)
+                invalid_offset: INVALID_OFFSET for SR, ZERO_OFFSET for LR
             """
             r_i = positions[safe_idx_i]
             r_j = positions[safe_idx_j]
-            disp_raw = r_j - r_i
-            
-            # Use inv(cell) for consistency with Reference/GLP
-            # cell is (3,3) in ASE convention (rows)
-            inv_cell = jnp.linalg.inv(cell)
-            disp_frac = jnp.dot(disp_raw, inv_cell)
-            
+            disp_frac = jnp.dot(r_j - r_i, inv_cell)
             offset = -jnp.round(disp_frac).astype(jnp.int32)
-            return jnp.where(valid_mask[:, None], offset, INVALID_OFFSET)
+            return jnp.where(valid_mask[:, None], offset, invalid_offset)
         
-        def compute_offsets_lr(positions, safe_idx_i, safe_idx_j, cell, valid_mask):
-            """Compute integer cell offsets for LR edges.
+        def model_single(static_inputs, positions, cell):
+            """Execute model for a single bead using cached static inputs.
             
-            DIFFERENCE FROM SR: Invalid LR edges get ZERO offset, not INVALID_OFFSET.
-            matches Reference/GLP logic using explicit inverse.
+            Note: atomic_numbers captured via closure (compile-time constant).
             """
-            r_i = positions[safe_idx_i]
-            r_j = positions[safe_idx_j]
-            disp_raw = r_j - r_i
-            
-            inv_cell = jnp.linalg.inv(cell)
-            disp_frac = jnp.dot(disp_raw, inv_cell)
-            
-            offset = -jnp.round(disp_frac).astype(jnp.int32)
-            return jnp.where(valid_mask[:, None], offset, ZERO_OFFSET)
-        
-        def model_single(static_inputs, positions, cell, atomic_numbers):
-            """Execute model for a single bead using cached static inputs."""
             # Unpack static inputs (NO recomputation!)
             safe_idx_i = static_inputs['safe_idx_i']
             safe_idx_j = static_inputs['safe_idx_j']
@@ -876,8 +862,10 @@ class SO3LR_driver(object):
             n_edges_lr = safe_idx_i_lr.shape[0]  # LR edge count for cell_lr broadcast
             
             # Dynamic: Compute cell offsets for PBC (used by model's internal displacement calculation)
-            final_offset = compute_offsets(positions, safe_idx_i, safe_idx_j, cell, valid_sr)
-            final_offset_lr = compute_offsets_lr(positions, safe_idx_i_lr, safe_idx_j_lr, cell, valid_lr)
+            # OPTIMIZATION: Invert cell ONCE (not twice for SR + LR)
+            inv_cell = jnp.linalg.inv(cell)
+            final_offset = compute_offsets(positions, safe_idx_i, safe_idx_j, inv_cell, valid_sr, INVALID_OFFSET)
+            final_offset_lr = compute_offsets(positions, safe_idx_i_lr, safe_idx_j_lr, inv_cell, valid_lr, ZERO_OFFSET)
             
             # NOTE: Model uses input_convention='positions' (default from load_model_from_workdir)
             # so it computes displacements internally from positions + cell_offset.
@@ -885,7 +873,7 @@ class SO3LR_driver(object):
 
             inputs = {
                 'positions': positions,
-                'atomic_numbers': atomic_numbers,
+                'atomic_numbers': atomic_numbers_const,  # Captured constant
                 'cell': jnp.broadcast_to(cell[None, :, :], (n_edges, 3, 3)),
                 'cell_per_atom': jnp.broadcast_to(cell[None, :, :], (n_atoms, 3, 3)),
                 'idx_i': safe_idx_i,
@@ -941,10 +929,11 @@ class SO3LR_driver(object):
             
             return energy_hartree, forces_hartree_bohr, stress_hartree_bohr
         
-        # in_axes: static_inputs dict batched, positions batched, cells batched, Z batched
+        # in_axes: static_inputs dict batched, positions batched, cells batched
+        # Note: atomic_numbers captured via closure, not passed as arg
         static_in_axes = {k: 0 for k in ['safe_idx_i', 'safe_idx_j', 'edge_mask', 'valid_sr',
                                           'safe_idx_i_lr', 'safe_idx_j_lr', 'edge_mask_lr', 'valid_lr']}
-        return jax.jit(jax.vmap(model_single, in_axes=(static_in_axes, 0, 0, 0)))
+        return jax.jit(jax.vmap(model_single, in_axes=(static_in_axes, 0, 0)))
 
     def _run_vmapped_calculation(self, batched_system, batched_neighbors, n_batch, needs_rebuild=False):
         """Execute vmapped calculation with SPLIT JIT architecture.
@@ -973,8 +962,8 @@ class SO3LR_driver(object):
         energies_batched, forces_batched, stresses_batched = self._model_jit(
             self._cached_static_inputs,
             batched_system.R,           # Positions (dynamic)
-            batched_system.cell,        # Cells (dynamic)
-            batched_system.Z            # Atomic numbers (static but passed through)
+            batched_system.cell         # Cells (dynamic)
+            # atomic_numbers captured via closure in _create_model_jit
         )
         
         # Transfer results to CPU
