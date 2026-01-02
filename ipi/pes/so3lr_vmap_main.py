@@ -55,6 +55,13 @@ from ase.io import read
 # Configure JAX memory management BEFORE importing JAX
 os.environ.setdefault('XLA_PYTHON_CLIENT_PREALLOCATE', 'false')
 
+# JAX x64 mode: Enable float64 support for numerical stability with large lr_cutoff.
+# Large lr_cutoff (e.g., 80 Å) causes float32 overflow in dispersion gradient (R^-11 term).
+# This is configured via environment variable so it takes effect before JAX import.
+# Usage: set dtype='float64' in driver options to activate.
+# NOTE: This env var is checked at JAX import time, so must be set early.
+os.environ.setdefault('JAX_ENABLE_X64', 'false')  # Default: off for performance
+
 # Deferred imports
 jax = None
 jnp = None
@@ -152,6 +159,15 @@ class SO3LR_driver(object):
         - ~1-4 seconds of setup time (no redundant weight loading)
         - ~120-570 MB of GPU memory (weights loaded only once via So3lr)
         """
+        # CRITICAL: Enable JAX x64 mode BEFORE importing JAX if float64 requested.
+        # This prevents overflow in dispersion gradient (R^-11 term) with large lr_cutoff.
+        dtype_str = self.kwargs.get('dtype', 'float32')
+        if dtype_str == 'float64':
+            import os
+            os.environ['JAX_ENABLE_X64'] = 'true'
+            if self.verbose:
+                print("[SO3LR] ⚠️ Enabling JAX x64 mode for float64 precision (required for large lr_cutoff)")
+        
         global jax, jnp
         import jax
         import jax.numpy as jnp
@@ -191,11 +207,6 @@ class SO3LR_driver(object):
         self.cutoff = float(self.kwargs.get('cutoff', 4.5))
         dtype_str = self.kwargs.get('dtype', 'float32')
         self.dtype = np.float32 if dtype_str == 'float32' else np.float64
-        # OPTIMIZATION: Pre-cast unit conversion constants to avoid float64 upcasting.
-        # NumPy upcasts float32 arrays to float64 when multiplied by Python float scalars.
-        # Casting these once avoids repeated conversion and keeps arrays in target dtype.
-        self._bohr_to_ang = self.dtype(BOHR_TO_ANG)
-        self._ang_to_bohr = self.dtype(ANG_TO_BOHR)
         # NOTE: Stress calculation is NOT yet supported by the So3lr wrapper.
         # The model only computes energy and forces. NPT simulations will receive zeros.
         # See PROJECT_CONTEXT.md Section 9 for details and future implementation plans.
@@ -278,10 +289,11 @@ class SO3LR_driver(object):
             # Still need to ensure LR arrays exist
             if target_lr_capacity and target_lr_capacity > 0:
                 if not hasattr(neighbors, 'idx_i_lr') or neighbors.idx_i_lr is None:
-                    # Create empty LR arrays with target capacity
+                    # Create LR arrays filled with n_atoms (invalid index) for consistency
+                    # with pad_leaf_with_path which also uses n_atoms as fill_value
                     neighbors = neighbors._replace(
-                        idx_i_lr=jnp.zeros((target_lr_capacity,), dtype=jnp.int32),
-                        idx_j_lr=jnp.zeros((target_lr_capacity,), dtype=jnp.int32)
+                        idx_i_lr=jnp.full((target_lr_capacity,), self.n_atoms, dtype=jnp.int32),
+                        idx_j_lr=jnp.full((target_lr_capacity,), self.n_atoms, dtype=jnp.int32)
                     )
             return neighbors
 
@@ -335,9 +347,10 @@ class SO3LR_driver(object):
         # Ensure LR arrays exist after padding
         if target_lr_capacity and target_lr_capacity > 0:
             if not hasattr(padded, 'idx_i_lr') or padded.idx_i_lr is None:
+                # Use n_atoms (invalid index) for consistency with pad_leaf_with_path
                 padded = padded._replace(
-                    idx_i_lr=jnp.zeros((target_lr_capacity,), dtype=jnp.int32),
-                    idx_j_lr=jnp.zeros((target_lr_capacity,), dtype=jnp.int32)
+                    idx_i_lr=jnp.full((target_lr_capacity,), self.n_atoms, dtype=jnp.int32),
+                    idx_j_lr=jnp.full((target_lr_capacity,), self.n_atoms, dtype=jnp.int32)
                 )
         
         # CRITICAL FIX: Reset overflow flag after padding to prevent false overflow detection
@@ -997,12 +1010,15 @@ class SO3LR_driver(object):
         if self._zero_stresses is None or self._zero_stresses.shape[0] != n_batch:
             self._zero_stresses = np.zeros((n_batch, 3, 3), dtype=self.dtype)
 
-        # 1. Unit Conversion
-        # OPTIMIZATION: Cast to target dtype EARLY and use dtype-matched constants.
-        # This avoids float64 temporaries (NumPy upcasts float32 * Python float → float64).
-        # Benefits: Reduced CPU bandwidth + smaller host→device transfers for float32.
-        cell_ang_b = np.asarray(cell_list, dtype=self.dtype) * self._bohr_to_ang
-        pos_ang_b = np.asarray(pos_list, dtype=self.dtype) * self._bohr_to_ang
+        # 1. Unit Conversion (HIGH-PRECISION)
+        # Perform Bohr → Angstrom conversion in float64 to preserve maximum precision.
+        # Casting to float32 BEFORE multiplication introduces quantization error in:
+        #   1. Input positions (Bohr) quantized from i-PI's float64
+        #   2. The conversion factor itself
+        # By converting in float64 first, we preserve ~15 digits of precision during
+        # the arithmetic, only truncating to float32 when creating JAX arrays.
+        cell_ang_b = (np.asarray(cell_list, dtype=np.float64) * BOHR_TO_ANG).astype(self.dtype)
+        pos_ang_b = (np.asarray(pos_list, dtype=np.float64) * BOHR_TO_ANG).astype(self.dtype)
 
         # 2. Prepare JAX arrays
         # NOTE: i-PI uses lattice vectors as COLUMNS, but ASE/GLP/MLFF expect ROWS.
