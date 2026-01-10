@@ -184,7 +184,6 @@ class SO3LR_driver(object):
         self.num_unpaired_electrons = int(self.kwargs.get('num_unpaired_electrons', 0))
 
         # Neighbor list parameters
-        self.skin = float(self.kwargs.get('skin', 1.0))
         self.capacity_multiplier = float(self.kwargs.get('capacity_multiplier', 1.25))
         self.buffer_size_multiplier = float(self.kwargs.get('buffer_size_multiplier', 1.25))
 
@@ -318,8 +317,9 @@ class SO3LR_driver(object):
             from glp.neighborlist import quadratic_neighbor_list
             
             cell_init = self._system_template.cell
+            # skin=0.0: We always use force_update=True, so skin-based caching is disabled
             self._neighbor_allocator, self._glp_update_fn = quadratic_neighbor_list(
-                cell=cell_init, cutoff=self.cutoff, skin=self.skin,
+                cell=cell_init, cutoff=self.cutoff, skin=0.0,
                 capacity_multiplier=self.capacity_multiplier, lr_cutoff=self.lr_cutoff
             )
             positions_init = jnp.array(pos_ang_b[0], dtype=self.dtype)
