@@ -33,6 +33,15 @@ native point_mask mechanism in mlff/nn/stacknet/stacknet.py.
 NEIGHBOR LIST STRATEGY:
 ======================
 Rebuilds neighbor lists EVERY STEP with force_update=True for correctness.
+
+VACUUM MODE:
+===========
+When vacuum=True is set, PBC is disabled by passing cell=None to GLP's neighbor
+list functions. This provides:
+- No minimum image convention (Cartesian displacements only)
+- No cell offset computation (offsets are always zero)
+- No fractional coordinate conversion
+- Ideal for isolated molecules/clusters
 """
 
 import os
@@ -42,6 +51,9 @@ import pathlib
 import numpy as np
 from ase import Atoms
 from ase.io import read
+
+# Configure JAX memory management BEFORE importing JAX
+os.environ.setdefault('XLA_PYTHON_CLIENT_PREALLOCATE', 'false')
 
 
 # --- Unit conversion constants ---
@@ -80,6 +92,14 @@ class SO3LR_driver(object):
     
     Uses jraph-style padding node (z=0) for safe edge handling.
     Works with vanilla mlff without any patches.
+    
+    Args:
+        template: Path to XYZ file defining the system (atomic numbers, etc.)
+        vacuum: If True, disable PBC (gas-phase/isolated molecule mode)
+        lr_cutoff: Long-range cutoff in Angstrom (default: 12.0)
+        cutoff: Short-range cutoff in Angstrom (default: 4.5)
+        dtype: 'float32' or 'float64' (default: 'float32')
+        verbose: Print diagnostics (default: False)
     """
 
     def __init__(self, verbose=False, *args, **kwargs):
@@ -89,6 +109,9 @@ class SO3LR_driver(object):
 
         # Components
         self.so3lr_calc = None  # Direct So3lr model
+        
+        # Vacuum mode: disable PBC for isolated molecules
+        self.vacuum = kwargs.get('vacuum', False)
 
         # Template and data
         self.template_atoms = None
@@ -148,6 +171,19 @@ class SO3LR_driver(object):
         global jax, jnp
         import jax
         import jax.numpy as jnp
+        
+        # === PRECISION HARDENING ===
+        # Disable TF32 at CUDA driver level (must be set before any CUDA ops)
+        # TF32 uses only 10 mantissa bits vs 23 for true float32, causing accuracy issues
+        os.environ['NVIDIA_TF32_OVERRIDE'] = '0'
+        
+        # Configure JAX matmul precision to maximum
+        # Options: 'default' (TF32 on compatible GPUs), 'float32' (true FP32), 'highest' (max precision)
+        matmul_precision = self.kwargs.get('matmul_precision', 'highest')
+        if matmul_precision != 'default':
+            jax.config.update("jax_default_matmul_precision", matmul_precision)
+            if self.verbose:
+                print(f"[SO3LR] ✓ Matmul precision set to '{matmul_precision}' (TF32 disabled via NVIDIA_TF32_OVERRIDE=0)")
 
         from glp import System, atoms_to_system
         from so3lr import So3lr
@@ -166,12 +202,14 @@ class SO3LR_driver(object):
             raise ValueError("Must provide 'template' parameter with path to xyz file")
 
         self.template_atoms = read(template_path)
-        self.template_atoms.set_pbc(True)
+        # Set PBC based on vacuum mode
+        self.template_atoms.set_pbc(not self.vacuum)
         self.atomic_numbers = self.template_atoms.get_atomic_numbers()
         self.n_atoms = len(self.template_atoms)
 
         if self.verbose:
-            print(f"[SO3LR] Loaded template with {self.n_atoms} atoms")
+            pbc_status = "VACUUM (no PBC)" if self.vacuum else "PERIODIC (PBC enabled)"
+            print(f"[SO3LR] Loaded template with {self.n_atoms} atoms, mode: {pbc_status}")
 
         # Parameters
         self.lr_cutoff = float(self.kwargs.get('lr_cutoff', 12.0))
@@ -183,9 +221,8 @@ class SO3LR_driver(object):
         self.total_charge = int(self.kwargs.get('total_charge', 0))
         self.num_unpaired_electrons = int(self.kwargs.get('num_unpaired_electrons', 0))
 
-        # Neighbor list parameters
+        # Neighbor list parameters (GLP only uses capacity_multiplier, not buffer_size_multiplier)
         self.capacity_multiplier = float(self.kwargs.get('capacity_multiplier', 1.25))
-        self.buffer_size_multiplier = float(self.kwargs.get('buffer_size_multiplier', 1.25))
 
         # Model path
         model_path = self.kwargs.get('model_path')
@@ -310,13 +347,24 @@ class SO3LR_driver(object):
         if self._system_template is None:
             atoms = self.template_atoms.copy()
             atoms.set_positions(pos_ang_b[0], apply_constraint=False)
-            atoms.set_cell(cell_ang_b[0].T, scale_atoms=False)
+            
+            if self.vacuum:
+                # Vacuum mode: no cell, no PBC
+                atoms.set_cell(None, scale_atoms=False)
+                atoms.set_pbc(False)
+            else:
+                # Periodic mode: set cell from input
+                atoms.set_cell(cell_ang_b[0].T, scale_atoms=False)
+                
             self._system_template = self._atoms_to_system(atoms, dtype=self.dtype)
 
         if not self._nl_initialized:
             from glp.neighborlist import quadratic_neighbor_list
             
-            cell_init = self._system_template.cell
+            # CRITICAL: Pass cell=None for vacuum mode
+            # GLP's displacement() function checks: if cell is None → use Rb - Ra (no PBC)
+            cell_init = None if self.vacuum else self._system_template.cell
+            
             # skin=0.0: We always use force_update=True, so skin-based caching is disabled
             self._neighbor_allocator, self._glp_update_fn = quadratic_neighbor_list(
                 cell=cell_init, cutoff=self.cutoff, skin=0.0,
@@ -344,7 +392,8 @@ class SO3LR_driver(object):
             self._nl_initialized = True
             
             if self.verbose:
-                print(f"[SO3LR] ✓ GLP neighbor list initialized (SR: {self._max_neighbor_capacity_seen}, LR: {self._max_neighbor_lr_capacity_seen})")
+                mode_str = "VACUUM (cell=None)" if self.vacuum else "PERIODIC"
+                print(f"[SO3LR] ✓ GLP neighbor list initialized ({mode_str}, SR: {self._max_neighbor_capacity_seen}, LR: {self._max_neighbor_lr_capacity_seen})")
 
     def _update_neighbor_lists(self, positions_batched, cell_tensors_batched, n_batch, diagnostics=False):
         """Update neighbor lists every step using force_update=True."""
@@ -363,19 +412,37 @@ class SO3LR_driver(object):
                 print(f"[SO3LR] Created stacked template for batch_size={n_batch}")
         
         if not hasattr(self, '_vmapped_force_rebuild_fn') or self._vmapped_force_rebuild_fn is None:
-            def force_rebuild_single(pos, nbrs, cell):
-                return self._glp_update_fn(pos, nbrs, new_cell=cell, force_update=True)
-            
-            self._vmapped_force_rebuild_fn = jax.jit(jax.vmap(
-                force_rebuild_single,
-                in_axes=(0, self._neighbors_in_axes, 0)
-            ))
+            if self.vacuum:
+                # Vacuum mode: no cell argument, pass new_cell=None
+                def force_rebuild_single_vacuum(pos, nbrs):
+                    return self._glp_update_fn(pos, nbrs, new_cell=None, force_update=True)
+                
+                self._vmapped_force_rebuild_fn = jax.jit(jax.vmap(
+                    force_rebuild_single_vacuum,
+                    in_axes=(0, self._neighbors_in_axes)
+                ))
+            else:
+                # Periodic mode: cell argument required
+                def force_rebuild_single(pos, nbrs, cell):
+                    return self._glp_update_fn(pos, nbrs, new_cell=cell, force_update=True)
+                
+                self._vmapped_force_rebuild_fn = jax.jit(jax.vmap(
+                    force_rebuild_single,
+                    in_axes=(0, self._neighbors_in_axes, 0)
+                ))
         
-        updated_neighbors_batched = self._vmapped_force_rebuild_fn(
-            positions_batched,
-            self._stacked_template_neighbors,
-            cell_tensors_batched
-        )
+        # Call the vmapped function based on mode
+        if self.vacuum:
+            updated_neighbors_batched = self._vmapped_force_rebuild_fn(
+                positions_batched,
+                self._stacked_template_neighbors
+            )
+        else:
+            updated_neighbors_batched = self._vmapped_force_rebuild_fn(
+                positions_batched,
+                self._stacked_template_neighbors,
+                cell_tensors_batched
+            )
         
         # Check for overflow
         overflow_flags = updated_neighbors_batched.overflow
@@ -389,9 +456,15 @@ class SO3LR_driver(object):
             
             for i in range(n_batch):
                 if overflow_np[i]:
-                    neighbors_list[i] = self._neighbor_allocator(
-                        positions_batched[i], new_cell=cell_tensors_batched[i]
-                    )
+                    # For vacuum mode, pass new_cell=None
+                    if self.vacuum:
+                        neighbors_list[i] = self._neighbor_allocator(
+                            positions_batched[i], new_cell=None
+                        )
+                    else:
+                        neighbors_list[i] = self._neighbor_allocator(
+                            positions_batched[i], new_cell=cell_tensors_batched[i]
+                        )
             
             max_sr_cap = max(n.centers.shape[0] for n in neighbors_list)
             lr_caps = [n.idx_i_lr.shape[0] for n in neighbors_list
@@ -447,6 +520,12 @@ class SO3LR_driver(object):
         → Padding node gets point_mask = 0
         → Any contribution from/to padding node is automatically zeroed
         → NO mlff patches required!
+        
+        VACUUM MODE:
+        ===========
+        When vacuum=True, cell offsets are always zero (no PBC wrapping),
+        and cell is set to None in inputs. This provides performance savings
+        since no fractional coordinate conversion or offset computation is needed.
         """
         dtype = self.dtype
         so3lr_calc = self.so3lr_calc
@@ -455,6 +534,7 @@ class SO3LR_driver(object):
         num_unpaired_electrons = self.num_unpaired_electrons
         theory_mask_const = self._theory_mask_const
         atomic_numbers_const = jnp.array(self.atomic_numbers, dtype=jnp.int32)
+        vacuum_mode = self.vacuum  # Capture vacuum flag
         
         # PADDING NODE INDEX: One node after all real atoms
         PADDING_NODE_IDX = n_atoms
@@ -472,7 +552,7 @@ class SO3LR_driver(object):
             safe_idx_j = jnp.where(valid_mask, idx_j, PADDING_NODE_IDX)
             return valid_mask, safe_idx_i, safe_idx_j
         
-        def compute_offsets(frac_positions, safe_idx_i, safe_idx_j, valid_mask):
+        def compute_offsets_pbc(frac_positions, safe_idx_i, safe_idx_j, valid_mask):
             """Compute integer cell offsets for PBC.
             
             For invalid edges (pointing to padding node), use zero offset.
@@ -484,141 +564,272 @@ class SO3LR_driver(object):
             # Use zero offset for invalid edges (they point to padding node anyway)
             return jnp.where(valid_mask[:, None], offset, 0)
         
-        def compute_single(neighbors, positions, cell):
-            """Fused computation for a single bead with NATIVE PADDING.
-            
-            Adds a padding node with z=0 at the end of node arrays.
-            Invalid edges point to this padding node.
-            """
+        if vacuum_mode:
             # =====================================================
-            # TOPOLOGY: Compute indices with NATIVE PADDING
+            # VACUUM MODE: Simplified compute function (no cell)
             # =====================================================
-            idx_i = neighbors.centers
-            idx_j = neighbors.others
-            
-            # Remap invalid edges to PADDING NODE (not node 0)
-            valid_sr, safe_idx_i, safe_idx_j = detect_valid_and_remap(idx_i, idx_j)
-            
-            # Handle LR indices
-            idx_i_lr = getattr(neighbors, 'idx_i_lr', None)
-            idx_j_lr = getattr(neighbors, 'idx_j_lr', None)
-            
-            if idx_i_lr is None:
-                idx_i_lr = jnp.zeros((0,), dtype=jnp.int32)
-            if idx_j_lr is None:
-                idx_j_lr = jnp.zeros((0,), dtype=jnp.int32)
-            
-            valid_lr, safe_idx_i_lr, safe_idx_j_lr = detect_valid_and_remap(idx_i_lr, idx_j_lr)
-            
-            # =====================================================
-            # CREATE NODE ARRAYS WITH PADDING NODE
-            # =====================================================
-            # Add one padding node with z=0 at the end
-            
-            # Positions: real atoms + padding node at origin
-            positions_with_pad = jnp.concatenate([
-                positions,
-                jnp.zeros((1, 3), dtype=dtype)  # Padding node at origin
-            ])
-            
-            # Atomic numbers: real atoms + z=0 for padding
-            # z=0 → init_masks() computes point_mask=0 for this node automatically!
-            atomic_numbers_with_pad = jnp.concatenate([
-                atomic_numbers_const,
-                jnp.array([0], dtype=jnp.int32)  # z=0 → point_mask=0
-            ])
-            
-            # Cell per atom (for LR offset calculation)
-            cell_per_atom = jnp.broadcast_to(cell[None, :, :], (n_total_nodes, 3, 3))
-            
-            # Node mask: 1.0 for real atoms, 0.0 for padding
-            node_mask = jnp.concatenate([
-                jnp.ones(n_atoms, dtype=dtype),
-                jnp.zeros(1, dtype=dtype)
-            ])
-            
-            # Batch segments: real atoms belong to graph 0, padding node to graph 1
-            batch_segments = jnp.concatenate([
-                jnp.zeros(n_atoms, dtype=jnp.int32),
-                jnp.array([1], dtype=jnp.int32)  # Padding node → padding graph
-            ])
-            
-            # Hirshfeld ratios (needed by model)
-            hirshfeld_with_pad = jnp.zeros(n_total_nodes, dtype=dtype)
-            
-            # Forces placeholder
-            forces_placeholder = jnp.zeros((n_total_nodes, 3), dtype=dtype)
-            
-            # =====================================================
-            # COMPUTE CELL OFFSETS
-            # =====================================================
-            n_edges = safe_idx_i.shape[0]
-            n_edges_lr = safe_idx_i_lr.shape[0]
-            
-            # Pre-compute fractional positions (O(n_atoms) matmul, done once)
-            inv_cell = jnp.linalg.inv(cell)
-            # Use positions_with_pad for fractional coords (includes padding node)
-            frac_positions = jnp.dot(positions_with_pad, inv_cell)
-            
-            final_offset = compute_offsets(frac_positions, safe_idx_i, safe_idx_j, valid_sr)
-            final_offset_lr = compute_offsets(frac_positions, safe_idx_i_lr, safe_idx_j_lr, valid_lr)
-            
-            # =====================================================
-            # CONSTRUCT INPUTS with PADDING GRAPH
-            # =====================================================
-            # We have 2 graphs: real graph (index 0) + padding graph (index 1)
-            
-            inputs = {
-                # Node features (includes padding node)
-                'positions': positions_with_pad,
-                'atomic_numbers': atomic_numbers_with_pad,
-                'cell_per_atom': cell_per_atom,
-                'node_mask': node_mask,
-                'hirshfeld_ratios': hirshfeld_with_pad,
-                'forces': forces_placeholder,
+            def compute_single_vacuum(neighbors, positions):
+                """Fused computation for a single bead in VACUUM mode (no PBC).
                 
-                # Batch metadata (2 graphs: real + padding)
-                'batch_segments': batch_segments,
+                No cell offset computation needed - all offsets are zero.
+                """
+                # =====================================================
+                # TOPOLOGY: Compute indices with NATIVE PADDING
+                # =====================================================
+                idx_i = neighbors.centers
+                idx_j = neighbors.others
                 
-                # SR edge features (invalid edges point to padding node)
-                'cell': jnp.broadcast_to(cell[None, :, :], (n_edges, 3, 3)),
-                'idx_i': safe_idx_i,
-                'idx_j': safe_idx_j,
-                'cell_offset': final_offset,
+                # Remap invalid edges to PADDING NODE (not node 0)
+                valid_sr, safe_idx_i, safe_idx_j = detect_valid_and_remap(idx_i, idx_j)
                 
-                # LR edge features (invalid edges point to padding node)
-                'idx_i_lr': safe_idx_i_lr,
-                'idx_j_lr': safe_idx_j_lr,
-                'cell_offset_lr': final_offset_lr,
-                'cell_lr': jnp.broadcast_to(cell[None, :, :], (n_edges_lr, 3, 3)),
+                # Handle LR indices
+                idx_i_lr = getattr(neighbors, 'idx_i_lr', None)
+                idx_j_lr = getattr(neighbors, 'idx_j_lr', None)
                 
-                # Global features (2 graphs)
-                'total_charge': jnp.array([total_charge, 0], dtype=jnp.int16),
-                'num_unpaired_electrons': jnp.array([num_unpaired_electrons, 0], dtype=jnp.int16),
-                'theory_mask': jnp.tile(theory_mask_const, (2, 1)),  # 2 graphs
-                'graph_mask': jnp.array([True, False]),  # Real graph True, padding graph False
-                'energy': jnp.zeros(2, dtype=dtype),
-            }
+                if idx_i_lr is None:
+                    idx_i_lr = jnp.zeros((0,), dtype=jnp.int32)
+                if idx_j_lr is None:
+                    idx_j_lr = jnp.zeros((0,), dtype=jnp.int32)
+                
+                valid_lr, safe_idx_i_lr, safe_idx_j_lr = detect_valid_and_remap(idx_i_lr, idx_j_lr)
+                
+                # =====================================================
+                # CREATE NODE ARRAYS WITH PADDING NODE
+                # =====================================================
+                # Positions: real atoms + padding node at origin
+                positions_with_pad = jnp.concatenate([
+                    positions,
+                    jnp.zeros((1, 3), dtype=dtype)  # Padding node at origin
+                ])
+                
+                # Atomic numbers: real atoms + z=0 for padding
+                atomic_numbers_with_pad = jnp.concatenate([
+                    atomic_numbers_const,
+                    jnp.array([0], dtype=jnp.int32)  # z=0 → point_mask=0
+                ])
+                
+                # Node mask: 1.0 for real atoms, 0.0 for padding
+                node_mask = jnp.concatenate([
+                    jnp.ones(n_atoms, dtype=dtype),
+                    jnp.zeros(1, dtype=dtype)
+                ])
+                
+                # Batch segments: real atoms belong to graph 0, padding node to graph 1
+                batch_segments = jnp.concatenate([
+                    jnp.zeros(n_atoms, dtype=jnp.int32),
+                    jnp.array([1], dtype=jnp.int32)  # Padding node → padding graph
+                ])
+                
+                # Hirshfeld ratios (needed by model)
+                hirshfeld_with_pad = jnp.zeros(n_total_nodes, dtype=dtype)
+                
+                # Forces placeholder
+                forces_placeholder = jnp.zeros((n_total_nodes, 3), dtype=dtype)
+                
+                # =====================================================
+                # VACUUM MODE: No cell offsets needed
+                # =====================================================
+                n_edges = safe_idx_i.shape[0]
+                n_edges_lr = safe_idx_i_lr.shape[0]
+                
+                # OPTIMIZATION: MLFF skips offset application when cell=None.
+                # Use zeros but let XLA's dead-code elimination handle it.
+                # (Keeping zeros for shape compatibility with MLFF's inputs dict)
+                final_offset = jnp.zeros((n_edges, 3), dtype=jnp.int32)
+                final_offset_lr = jnp.zeros((n_edges_lr, 3), dtype=jnp.int32)
+                
+                # =====================================================
+                # CONSTRUCT INPUTS with PADDING GRAPH (NO CELL for vacuum)
+                # =====================================================
+                inputs = {
+                    # Node features (includes padding node)
+                    'positions': positions_with_pad,
+                    'atomic_numbers': atomic_numbers_with_pad,
+                    'cell_per_atom': None,  # No cell in vacuum mode
+                    'node_mask': node_mask,
+                    'hirshfeld_ratios': hirshfeld_with_pad,
+                    'forces': forces_placeholder,
+                    
+                    # Batch metadata (2 graphs: real + padding)
+                    'batch_segments': batch_segments,
+                    
+                    # SR edge features (invalid edges point to padding node)
+                    'cell': None,  # No cell in vacuum mode
+                    'idx_i': safe_idx_i,
+                    'idx_j': safe_idx_j,
+                    'cell_offset': final_offset,
+                    
+                    # LR edge features (invalid edges point to padding node)
+                    'idx_i_lr': safe_idx_i_lr,
+                    'idx_j_lr': safe_idx_j_lr,
+                    'cell_offset_lr': final_offset_lr,
+                    'cell_lr': None,  # No cell in vacuum mode
+                    
+                    # Global features (2 graphs)
+                    'total_charge': jnp.array([total_charge, 0], dtype=jnp.int16),
+                    'num_unpaired_electrons': jnp.array([num_unpaired_electrons, 0], dtype=jnp.int16),
+                    'theory_mask': jnp.tile(theory_mask_const, (2, 1)),  # 2 graphs
+                    'graph_mask': jnp.array([True, False]),  # Real graph True, padding graph False
+                    'energy': jnp.zeros(2, dtype=dtype),
+                }
 
-            # =====================================================
-            # RUN MODEL
-            # =====================================================
-            output = so3lr_calc(inputs)
+                # =====================================================
+                # RUN MODEL
+                # =====================================================
+                output = so3lr_calc(inputs)
+                
+                # Extract results (ONLY from real graph/nodes)
+                energy = output['energy'][0]
+                forces = output['forces'][:n_atoms]
+                
+                # Unit conversion on GPU
+                energy_hartree = energy * EV_TO_HARTREE
+                forces_hartree_bohr = forces * (EV_TO_HARTREE * BOHR_TO_ANG)
+                
+                return energy_hartree, forces_hartree_bohr
             
-            # Extract results (ONLY from real graph/nodes)
-            # Energy: only first graph (real), ignore padding graph
-            energy = output['energy'][0]
-            
-            # Forces: only first n_atoms (real), ignore padding node
-            forces = output['forces'][:n_atoms]
-            
-            # Unit conversion on GPU
-            energy_hartree = energy * EV_TO_HARTREE
-            forces_hartree_bohr = forces * (EV_TO_HARTREE * BOHR_TO_ANG)
-            
-            return energy_hartree, forces_hartree_bohr
+            # Vacuum mode: no cell in vmap
+            return jax.jit(jax.vmap(compute_single_vacuum, in_axes=(self._neighbors_in_axes, 0)))
         
-        return jax.jit(jax.vmap(compute_single, in_axes=(self._neighbors_in_axes, 0, 0)))
+        else:
+            # =====================================================
+            # PERIODIC MODE: Full PBC computation with cell
+            # =====================================================
+            def compute_single(neighbors, positions, cell):
+                """Fused computation for a single bead with NATIVE PADDING.
+                
+                Adds a padding node with z=0 at the end of node arrays.
+                Invalid edges point to this padding node.
+                """
+                # =====================================================
+                # TOPOLOGY: Compute indices with NATIVE PADDING
+                # =====================================================
+                idx_i = neighbors.centers
+                idx_j = neighbors.others
+                
+                # Remap invalid edges to PADDING NODE (not node 0)
+                valid_sr, safe_idx_i, safe_idx_j = detect_valid_and_remap(idx_i, idx_j)
+                
+                # Handle LR indices
+                idx_i_lr = getattr(neighbors, 'idx_i_lr', None)
+                idx_j_lr = getattr(neighbors, 'idx_j_lr', None)
+                
+                if idx_i_lr is None:
+                    idx_i_lr = jnp.zeros((0,), dtype=jnp.int32)
+                if idx_j_lr is None:
+                    idx_j_lr = jnp.zeros((0,), dtype=jnp.int32)
+                
+                valid_lr, safe_idx_i_lr, safe_idx_j_lr = detect_valid_and_remap(idx_i_lr, idx_j_lr)
+                
+                # =====================================================
+                # CREATE NODE ARRAYS WITH PADDING NODE
+                # =====================================================
+                # Add one padding node with z=0 at the end
+                
+                # Positions: real atoms + padding node at origin
+                positions_with_pad = jnp.concatenate([
+                    positions,
+                    jnp.zeros((1, 3), dtype=dtype)  # Padding node at origin
+                ])
+                
+                # Atomic numbers: real atoms + z=0 for padding
+                # z=0 → init_masks() computes point_mask=0 for this node automatically!
+                atomic_numbers_with_pad = jnp.concatenate([
+                    atomic_numbers_const,
+                    jnp.array([0], dtype=jnp.int32)  # z=0 → point_mask=0
+                ])
+                
+                # Cell per atom (for LR offset calculation)
+                cell_per_atom = jnp.broadcast_to(cell[None, :, :], (n_total_nodes, 3, 3))
+                
+                # Node mask: 1.0 for real atoms, 0.0 for padding
+                node_mask = jnp.concatenate([
+                    jnp.ones(n_atoms, dtype=dtype),
+                    jnp.zeros(1, dtype=dtype)
+                ])
+                
+                # Batch segments: real atoms belong to graph 0, padding node to graph 1
+                batch_segments = jnp.concatenate([
+                    jnp.zeros(n_atoms, dtype=jnp.int32),
+                    jnp.array([1], dtype=jnp.int32)  # Padding node → padding graph
+                ])
+                
+                # Hirshfeld ratios (needed by model)
+                hirshfeld_with_pad = jnp.zeros(n_total_nodes, dtype=dtype)
+                
+                # Forces placeholder
+                forces_placeholder = jnp.zeros((n_total_nodes, 3), dtype=dtype)
+                
+                # =====================================================
+                # COMPUTE CELL OFFSETS (PBC MODE)
+                # =====================================================
+                n_edges = safe_idx_i.shape[0]
+                n_edges_lr = safe_idx_i_lr.shape[0]
+                
+                # Pre-compute fractional positions (O(n_atoms) matmul, done once)
+                inv_cell = jnp.linalg.inv(cell)
+                # Use positions_with_pad for fractional coords (includes padding node)
+                frac_positions = jnp.dot(positions_with_pad, inv_cell)
+                
+                final_offset = compute_offsets_pbc(frac_positions, safe_idx_i, safe_idx_j, valid_sr)
+                final_offset_lr = compute_offsets_pbc(frac_positions, safe_idx_i_lr, safe_idx_j_lr, valid_lr)
+                
+                # =====================================================
+                # CONSTRUCT INPUTS with PADDING GRAPH
+                # =====================================================
+                # We have 2 graphs: real graph (index 0) + padding graph (index 1)
+                
+                inputs = {
+                    # Node features (includes padding node)
+                    'positions': positions_with_pad,
+                    'atomic_numbers': atomic_numbers_with_pad,
+                    'cell_per_atom': cell_per_atom,
+                    'node_mask': node_mask,
+                    'hirshfeld_ratios': hirshfeld_with_pad,
+                    'forces': forces_placeholder,
+                    
+                    # Batch metadata (2 graphs: real + padding)
+                    'batch_segments': batch_segments,
+                    
+                    # SR edge features (invalid edges point to padding node)
+                    'cell': jnp.broadcast_to(cell[None, :, :], (n_edges, 3, 3)),
+                    'idx_i': safe_idx_i,
+                    'idx_j': safe_idx_j,
+                    'cell_offset': final_offset,
+                    
+                    # LR edge features (invalid edges point to padding node)
+                    'idx_i_lr': safe_idx_i_lr,
+                    'idx_j_lr': safe_idx_j_lr,
+                    'cell_offset_lr': final_offset_lr,
+                    'cell_lr': jnp.broadcast_to(cell[None, :, :], (n_edges_lr, 3, 3)),
+                    
+                    # Global features (2 graphs)
+                    'total_charge': jnp.array([total_charge, 0], dtype=jnp.int16),
+                    'num_unpaired_electrons': jnp.array([num_unpaired_electrons, 0], dtype=jnp.int16),
+                    'theory_mask': jnp.tile(theory_mask_const, (2, 1)),  # 2 graphs
+                    'graph_mask': jnp.array([True, False]),  # Real graph True, padding graph False
+                    'energy': jnp.zeros(2, dtype=dtype),
+                }
+
+                # =====================================================
+                # RUN MODEL
+                # =====================================================
+                output = so3lr_calc(inputs)
+                
+                # Extract results (ONLY from real graph/nodes)
+                # Energy: only first graph (real), ignore padding graph
+                energy = output['energy'][0]
+                
+                # Forces: only first n_atoms (real), ignore padding node
+                forces = output['forces'][:n_atoms]
+                
+                # Unit conversion on GPU
+                energy_hartree = energy * EV_TO_HARTREE
+                forces_hartree_bohr = forces * (EV_TO_HARTREE * BOHR_TO_ANG)
+                
+                return energy_hartree, forces_hartree_bohr
+            
+            return jax.jit(jax.vmap(compute_single, in_axes=(self._neighbors_in_axes, 0, 0)))
 
     def _run_vmapped_calculation(self, batched_system, batched_neighbors, n_batch):
         """Execute vmapped calculation with NATIVE PADDING."""
@@ -626,11 +837,20 @@ class SO3LR_driver(object):
         if self._compute_jit is None:
             self._compute_jit = self._create_compute_jit()
         
-        energies_batched, forces_batched = self._compute_jit(
-            batched_neighbors,
-            batched_system.R,
-            batched_system.cell
-        )
+        # Call JIT function based on vacuum mode
+        if self.vacuum:
+            # Vacuum mode: no cell argument
+            energies_batched, forces_batched = self._compute_jit(
+                batched_neighbors,
+                batched_system.R
+            )
+        else:
+            # Periodic mode: cell argument required
+            energies_batched, forces_batched = self._compute_jit(
+                batched_neighbors,
+                batched_system.R,
+                batched_system.cell
+            )
         
         energies_k, forces_k = jax.device_get((energies_batched, forces_batched))
         
@@ -659,6 +879,8 @@ class SO3LR_driver(object):
         if self._zero_stresses is None or self._zero_stresses.shape[0] != n_batch:
             self._zero_stresses = np.zeros((n_batch, 3, 3), dtype=self.dtype)
 
+        t0 = time.time()
+
         # Unit Conversion
         cell_ang_b = (np.asarray(cell_list, dtype=np.float64) * BOHR_TO_ANG).astype(self.dtype)
         pos_ang_b = (np.asarray(pos_list, dtype=np.float64) * BOHR_TO_ANG).astype(self.dtype)
@@ -685,19 +907,32 @@ class SO3LR_driver(object):
              cell=cell_tensors_batched
         )
 
+        jax.block_until_ready(batched_system.R)
+        t_convert = time.time() - t0
+
+        t0 = time.time()
         # Update neighbor lists
         self._update_neighbor_lists(
             positions_batched, cell_tensors_batched, n_batch, diagnostics
         )
+        if self._batched_neighbors is not None:
+            # GLP NeighborList has 'centers'
+            jax.block_until_ready(self._batched_neighbors.centers)
+        t_nbrs = time.time() - t0
 
         batched_neighbors = self._batched_neighbors
 
+        t0 = time.time()
         # Execute fused computation with NATIVE PADDING
         results = self._run_vmapped_calculation(batched_system, batched_neighbors, n_batch)
+        t_compute = time.time() - t0
 
         if diagnostics:
             t_total = time.time() - start
             print(f"[SO3LR] Total: {t_total:.3f}s ({t_total/n_batch:.4f}s/struct)")
+            print(f"[SO3LR]   - Convert: {t_convert:.3f}s")
+            print(f"[SO3LR]   - NbrList: {t_nbrs:.3f}s")
+            print(f"[SO3LR]   - Compute: {t_compute:.3f}s")
 
         # Update cache
         self._cached_batched_system = batched_system
