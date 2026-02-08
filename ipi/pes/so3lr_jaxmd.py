@@ -1,26 +1,9 @@
-"""SO3LR driver using the native JAX-MD interface.
+"""SO3LR driver using the JAX-MD interface.
 
 This driver uses SO3LR's `to_jax_md()` function which provides a clean
 integration with JAX-MD's neighbor list and energy function interface.
 
-Key differences from so3lr_vmap_main.py:
-- Uses JAX-MD neighbor lists instead of GLP quadratic neighbor lists
-- Uses `jax_md.quantity.force()` for force computation via autodiff
-- Much simpler code (~200 lines vs ~700 lines)
-- Standard JAX-MD compatible interface
-
-Usage with FFDirect:
-    <ffdirect name="so3lr" pes="so3lr_jaxmd" batch_size="8">
-        <parameters>
-            template: system.xyz
-            total_charge: 0
-        </parameters>
-    </ffdirect>
-
-Requires:
-    - so3lr
-    - jax_md
-    - jax
+Requires: so3lr, jax_md, jax
 """
 
 import os
@@ -45,6 +28,7 @@ import jax_md
 from jax_md import space
 
 from ase.io import read
+from ase.units import Bohr, Hartree, eV, Angstrom
 
 # Driver metadata for i-PI
 __DRIVER_NAME__ = "so3lr_jaxmd"
@@ -52,17 +36,29 @@ __DRIVER_CLASS__ = "SO3LR_JAXMD_driver"
 
 
 # Unit conversion constants
-BOHR_TO_ANG = 0.529177210903
+# i-PI communicates positions/cell in Bohr and expects energy in Hartree and
+# forces in Hartree/Bohr. SO3LR/JAX-MD operates in eV and Angstrom.
+
+# We use ASE's constants.
+BOHR_TO_ANG = float(Bohr / Angstrom)
 ANG_TO_BOHR = 1.0 / BOHR_TO_ANG
-HARTREE_TO_EV = 27.211386245988
+HARTREE_TO_EV = float(Hartree / eV)
 EV_TO_HARTREE = 1.0 / HARTREE_TO_EV
 
 
 class SO3LR_JAXMD_driver:
-    """SO3LR driver using the native JAX-MD interface.
+    """SO3LR driver using the JAX-MD interface.
     
     This driver wraps SO3LR's `to_jax_md()` function for use with i-PI's
     FFDirect mechanism. It handles batching over PIMD beads using vmap.
+    
+    Usage with FFDirect:
+        <ffdirect name="so3lr" pes="so3lr_jaxmd" batch_size="8">
+            <parameters>
+                template: system.xyz
+                total_charge: 0
+            </parameters>
+        </ffdirect>
     
     Args:
         template: Path to XYZ file defining the system (atomic numbers, etc.)
@@ -71,6 +67,9 @@ class SO3LR_JAXMD_driver:
         cutoff: Short-range cutoff in Angstrom (default: from model)
         lr_cutoff: Long-range cutoff in Angstrom (default: from model)
         capacity_multiplier: Buffer multiplier for neighbor lists (default: 1.25)
+        buffer_size_multiplier: Buffer multiplier for cell lists; applied to both
+            short-range and long-range lists unless explicitly overridden with
+            buffer_size_multiplier_sr / buffer_size_multiplier_lr.
         dtype: "float32" or "float64" (default: "float32")
         verbose: Print diagnostics (default: False)
     """
@@ -89,6 +88,14 @@ class SO3LR_JAXMD_driver:
         verbose: bool = False,
         **kwargs,
     ):
+        buffer_size_multiplier = kwargs.pop("buffer_size_multiplier", None)
+        if buffer_size_multiplier is not None:
+            buffer_size_multiplier = float(buffer_size_multiplier)
+            if buffer_size_multiplier_sr == 1.25:
+                buffer_size_multiplier_sr = buffer_size_multiplier
+            if buffer_size_multiplier_lr == 1.25:
+                buffer_size_multiplier_lr = buffer_size_multiplier
+
         self.template_path = template
         self.total_charge = total_charge
         self.num_unpaired_electrons = num_unpaired_electrons
@@ -115,9 +122,6 @@ class SO3LR_JAXMD_driver:
         # Fused kernels (update neighbor lists + compute E/F in one dispatch)
         self._vmapped_energy_and_force_fn = None
         self._update_and_compute_batched = None
-        
-        # Cached bead count for detecting batch size changes
-        self._n_beads_cached = 0
         
         # BATCHED neighbor list state (stacked PyTree for vmapped updates)
         # Array leaves have shape (n_beads, ...), static fields are shared
@@ -370,31 +374,6 @@ class SO3LR_JAXMD_driver:
         inv_box = jnp.linalg.inv(box_ang)
         return jnp.einsum('bni,ij->bnj', pos_ang, inv_box)
     
-    @staticmethod
-    def _batchify_neighborlist(nbrs, n_beads: int):
-        """Broadcast a single NeighborList to a batched PyTree.
-        
-        Uses broadcast_to for efficiency; XLA may defer materialization.
-        Only array leaves are broadcast; static fields (update_fn, format, etc.)
-        remain shared via PyTree aux_data.
-        
-        IMPORTANT: The returned neighborlist has IDENTICAL per-bead state.
-        Caller MUST immediately call vmapped update() to populate per-bead
-        indices before any computation.
-        
-        Args:
-            nbrs: A single NeighborList PyTree
-            n_beads: Number of beads to broadcast to
-            
-        Returns:
-            Batched NeighborList with array leaves of shape (n_beads, ...)
-        """
-        def bcast(x):
-            if isinstance(x, jax.Array):
-                return jnp.broadcast_to(x, (n_beads,) + x.shape)
-            return x
-        return jax.tree_util.tree_map(bcast, nbrs)
-    
     def _ensure_neighbor_lists(
         self, 
         stacked_pos_frac: jnp.ndarray,  # (n_beads, n_atoms, 3) fractional coords
@@ -402,12 +381,13 @@ class SO3LR_JAXMD_driver:
     ) -> bool:
         """Ensure neighbor lists are allocated for all beads.
         
-        Optimized allocation strategy:
-        1. Allocate ONCE using first bead's reference position
-        2. Broadcast to (n_beads, ...) via tree_map (O(1) in Python)
-        3. Run vmapped update to set correct per-bead state
+        Allocation strategy:
+        - Allocate a NeighborList per bead using a shared reference configuration.
+        - Stack the resulting PyTrees so array leaves have shape (n_beads, ...).
         
-        This is ~10x faster than the naive O(B) Python loop approach.
+        We intentionally allocate from the same reference configuration for all
+        beads to guarantee identical shapes (required for stacking/vmap).
+        This is only done on first use and after rare capacity overflows.
         
         Args:
             stacked_pos_frac: Pre-computed fractional positions (n_beads, n_atoms, 3)
@@ -417,32 +397,41 @@ class SO3LR_JAXMD_driver:
         """
         n_beads = stacked_pos_frac.shape[0]
         
-        # Allocate on first call or if batch size changed
-        if self._nbrs_batched is None or self._n_beads_cached != n_beads:
+        # Allocate on first call
+        if self._nbrs_batched is None:
             # Use first bead's position as reference for allocation
             ref_pos_frac = stacked_pos_frac[0]
             
             if self.verbose:
-                print(f"[SO3LR-JAXMD] Allocating neighbor lists for {n_beads} beads (optimized)...")
-            
-            # ================================================================
-            # OPTIMIZED ALLOCATION: Allocate ONCE, broadcast to all beads
-            # ================================================================
+                print(f"[SO3LR-JAXMD] Allocating neighbor lists for {n_beads} beads...")
+
+            def stack_pytree(pytree_list):
+                return jax.tree_util.tree_map(lambda *xs: jnp.stack(xs, axis=0), *pytree_list)
+
             if self.vacuum:
-                nbrs0 = self._neighbor_fn.allocate(ref_pos_frac, extra_capacity=0)
-                nbrs_lr0 = self._neighbor_fn_lr.allocate(ref_pos_frac, extra_capacity=0)
+                nbrs_list = [
+                    self._neighbor_fn.allocate(ref_pos_frac, extra_capacity=0)
+                    for _ in range(n_beads)
+                ]
+                nbrs_lr_list = [
+                    self._neighbor_fn_lr.allocate(ref_pos_frac, extra_capacity=0)
+                    for _ in range(n_beads)
+                ]
             else:
-                nbrs0 = self._neighbor_fn.allocate(ref_pos_frac, box=box_ang, extra_capacity=0)
-                nbrs_lr0 = self._neighbor_fn_lr.allocate(ref_pos_frac, box=box_ang, extra_capacity=0)
-            
-            # Broadcast to (n_beads, ...) - O(1) in Python, deferred in XLA
-            self._nbrs_batched = self._batchify_neighborlist(nbrs0, n_beads)
-            self._nbrs_lr_batched = self._batchify_neighborlist(nbrs_lr0, n_beads)
-            
-            self._n_beads_cached = n_beads
+                nbrs_list = [
+                    self._neighbor_fn.allocate(ref_pos_frac, box=box_ang, extra_capacity=0)
+                    for _ in range(n_beads)
+                ]
+                nbrs_lr_list = [
+                    self._neighbor_fn_lr.allocate(ref_pos_frac, box=box_ang, extra_capacity=0)
+                    for _ in range(n_beads)
+                ]
+
+            self._nbrs_batched = stack_pytree(nbrs_list)
+            self._nbrs_lr_batched = stack_pytree(nbrs_lr_list)
             
             if self.verbose:
-                print(f"[SO3LR-JAXMD] Broadcast neighbor lists: "
+                print(f"[SO3LR-JAXMD] Stacked neighbor lists: "
                       f"idx={self._nbrs_batched.idx.shape}, idx_lr={self._nbrs_lr_batched.idx.shape}")
         
         return False
