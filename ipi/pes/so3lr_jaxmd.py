@@ -1,16 +1,15 @@
 """SO3LR driver using the JAX-MD interface.
 
-This driver uses SO3LR's `to_jax_md()` function which provides a clean
-integration with JAX-MD's neighbor list and energy function interface.
+This driver uses SO3LR's ``to_jax_md()`` function which integrates JAX-MD's neighbor list and energy function interface. Multiple PIMD beads are evaluated in parallel
+via ``jax.vmap``.
 
-Requires: so3lr, jax_md, jax
+Requires: so3lr, jax_md, jax, ase
 """
 
 import os
 import json
 import time
 import numpy as np
-from typing import List, Tuple, Optional, Dict, Any
 
 # Configure JAX memory management BEFORE importing JAX
 os.environ.setdefault('XLA_PYTHON_CLIENT_PREALLOCATE', 'false')
@@ -24,7 +23,6 @@ os.environ["NVIDIA_TF32_OVERRIDE"] = "0"
 
 import jax
 import jax.numpy as jnp
-import jax_md
 from jax_md import space
 
 from ase.io import read
@@ -41,37 +39,60 @@ __DRIVER_CLASS__ = "SO3LR_JAXMD_driver"
 
 # We use ASE's constants.
 BOHR_TO_ANG = float(Bohr / Angstrom)
-ANG_TO_BOHR = 1.0 / BOHR_TO_ANG
-HARTREE_TO_EV = float(Hartree / eV)
-EV_TO_HARTREE = 1.0 / HARTREE_TO_EV
+EV_TO_HARTREE = float(eV / Hartree)
 
 
 class SO3LR_JAXMD_driver:
     """SO3LR driver using the JAX-MD interface.
     
-    This driver wraps SO3LR's `to_jax_md()` function for use with i-PI's
+    This driver wraps SO3LR's ``to_jax_md()`` function for use with i-PI's
     FFDirect mechanism. It handles batching over PIMD beads using vmap.
     
-    Usage with FFDirect:
-        <ffdirect name="so3lr" pes="so3lr_jaxmd" batch_size="8">
-            <parameters>
-                template: system.xyz
-                total_charge: 0
+    Usage with FFDirect::
+    
+        <ffdirect name="so3lr_ff" threaded="false">
+            <pes>so3lr_jaxmd</pes>
+            <batch_size>32</batch_size>
+            <parameters>{
+                template: system.xyz,
+                lr_cutoff: 1000.0,
+                vacuum: true,
+                calculate_stress: false,
+                dtype: float32,
+                buffer_size_multiplier: 1.25,
+                capacity_multiplier: 1.25,
+                verbose: false
+                }
             </parameters>
         </ffdirect>
     
     Args:
-        template: Path to XYZ file defining the system (atomic numbers, etc.)
+        template: Path to XYZ file defining the system (atomic numbers,
+            initial cell, etc.)
         total_charge: Total system charge (default: 0)
         num_unpaired_electrons: Number of unpaired electrons (default: 0)
-        cutoff: Short-range cutoff in Angstrom (default: from model)
-        lr_cutoff: Long-range cutoff in Angstrom (default: from model)
-        capacity_multiplier: Buffer multiplier for neighbor lists (default: 1.25)
-        buffer_size_multiplier: Buffer multiplier for cell lists; applied to both
-            short-range and long-range lists unless explicitly overridden with
-            buffer_size_multiplier_sr / buffer_size_multiplier_lr.
+        lr_cutoff: Long-range cutoff in Angstrom (default: 12.0)
+        capacity_multiplier: Buffer multiplier for neighbor lists
+            (default: 1.25)
+        buffer_size_multiplier: Convenience alias that sets both
+            ``buffer_size_multiplier_sr`` and ``buffer_size_multiplier_lr``
+            unless they are explicitly overridden.
+        buffer_size_multiplier_sr: Buffer multiplier for short-range cell
+            lists (default: 1.25)
+        buffer_size_multiplier_lr: Buffer multiplier for long-range cell
+            lists (default: 1.25)
+        vacuum: If True, use free-space (no PBC) displacement and disable
+            cell lists. Suitable for gas-phase / isolated molecule
+            simulations (default: False)
         dtype: "float32" or "float64" (default: "float32")
-        verbose: Print diagnostics (default: False)
+        verbose: Print diagnostics every 100 evaluations (default: False)
+    
+    Notes:
+        - ``calculate_stress`` is accepted but currently ignored; stress
+          output is always zero.
+        - The short-range cutoff is determined by the SO3LR model and
+          cannot be changed here.
+        - All extra keyword arguments are forwarded to ``so3lr.to_jax_md()``.
     """
     
     def __init__(
@@ -106,10 +127,9 @@ class SO3LR_JAXMD_driver:
         self.dtype_str = dtype
         self.vacuum = vacuum
         self.verbose = verbose
-        self.kwargs = kwargs
+        self._extra_kwargs = kwargs
         
         # State
-        self._initialized = False
         self._template_atoms = None
         self._n_atoms = 0
         
@@ -117,7 +137,6 @@ class SO3LR_JAXMD_driver:
         self._neighbor_fn = None
         self._neighbor_fn_lr = None
         self._energy_fn = None
-        self._energy_and_force_fn = None  # Combined for efficiency
 
         # Fused kernels (update neighbor lists + compute E/F in one dispatch)
         self._vmapped_energy_and_force_fn = None
@@ -135,11 +154,117 @@ class SO3LR_JAXMD_driver:
         
         # Initialize
         self._initialize()
+
+    def __call__(
+        self,
+        cell: np.ndarray | list[np.ndarray],
+        pos: np.ndarray | list[np.ndarray],
+    ) -> tuple | list[tuple]:
+        """Unified interface for single or batched evaluation.
+        
+        Handles both:
+        - Single structure: cell is (3,3) array, pos is (n_atoms, 3) array
+        - Batch of structures: cell and pos are lists (from FFDirect batch_size > 1)
+        
+        Returns:
+            Single: (energy, forces, stress, extras) tuple
+            Batch: List of (energy, forces, stress, extras) tuples
+        """
+        if isinstance(cell, list):
+            return self.compute_batch(cell, pos)
+        
+        # Single structure: wrap as batch of 1, unwrap result
+        result = self.compute_batch([cell], [pos])
+        return result[0]
     
-    def _initialize(self):
+    def compute_batch(
+        self,
+        cell_list: list[np.ndarray],
+        pos_list: list[np.ndarray],
+    ) -> list[tuple[float, np.ndarray, np.ndarray, str]]:
+        """Batched evaluation for PIMD beads using vmap.
+        
+        Computes energies and forces for all beads in parallel on the GPU
+        via jax.vmap, with a fused neighbor-list-update + energy/force kernel.
+        
+        Args:
+            cell_list: List of (3, 3) cell matrices in Bohr
+            pos_list: List of (n_atoms, 3) positions in Bohr
+        
+        Returns:
+            List of (energy, forces, stress, extras) tuples
+        """
+        self.eval_count += 1
+        n_beads = len(pos_list)
+        
+        diagnostics = self.verbose and (self.eval_count % 100 == 0)
+        
+        if diagnostics:
+            print(f"[SO3LR-JAXMD] Batch #{self.eval_count}: {n_beads} beads (vmapped)")
+            start = time.perf_counter()
+            t0 = start
+        
+        # Pre-allocate stresses
+        if self._zero_stresses is None or self._zero_stresses.shape[0] != n_beads:
+            self._zero_stresses = np.zeros((n_beads, 3, 3), dtype=self.dtype)
+        
+        # Stack positions on CPU, single device_put
+        pos_arr = np.asarray(pos_list, dtype=self.dtype)
+        pos_stacked_np = pos_arr.reshape(n_beads, self._n_atoms, 3) * self._bohr_to_ang
+        stacked_pos_ang = jax.device_put(pos_stacked_np)
+        
+        # Convert to fractional coordinates (or keep Cartesian for vacuum)
+        if self.vacuum:
+            box_ang = None
+            stacked_pos_frac = stacked_pos_ang
+        else:
+            # NVT: all beads share the same box
+            box_np = np.asarray(cell_list[0], dtype=self.dtype) * self._bohr_to_ang
+            box_ang = jax.device_put(box_np)
+            stacked_pos_frac = self._to_fractional_batched(stacked_pos_ang, box_ang)
+        
+        if diagnostics:
+            jax.block_until_ready(stacked_pos_frac)
+            t_convert = time.perf_counter() - t0
+            t0 = time.perf_counter()
+        
+        # Ensure neighbor lists are allocated
+        self._ensure_neighbor_lists(stacked_pos_frac, box_ang)
+        
+        if diagnostics:
+            t0 = time.perf_counter()
+        
+        # Fused update + compute
+        energies_ev, forces_ev_ang = self._run_fused_kernel(stacked_pos_frac, box_ang)
+        
+        # Convert units: eV -> Hartree, eV/Angstrom -> Hartree/Bohr
+        energies = energies_ev * self._ev_to_hartree
+        forces = forces_ev_ang * self._ev_to_hartree * self._bohr_to_ang
+        
+        # Format results
+        results = [
+            (
+                float(energies[i]),
+                forces[i].ravel(),
+                self._zero_stresses[i],
+                self._empty_json,
+            )
+            for i in range(n_beads)
+        ]
+        
+        if diagnostics:
+            t_compute = time.perf_counter() - t0
+            elapsed = time.perf_counter() - start
+            print(f"[SO3LR-JAXMD] Total: {elapsed:.3f}s ({elapsed/n_beads:.4f}s/bead)")
+            print(f"[SO3LR-JAXMD]   - Convert: {t_convert:.3f}s")
+            print(f"[SO3LR-JAXMD]   - Compute: {t_compute:.3f}s")
+        
+        return results
+
+    # ── Initialization ────────────────────────────────────────────────────
+
+    def _initialize(self) -> None:
         """Initialize the driver."""
-        if self._initialized:
-            return
         
         # Configure JAX precision
         if self.dtype_str == "float64":
@@ -189,18 +314,16 @@ class SO3LR_JAXMD_driver:
             # This avoids O(box_volume) memory scaling for large boxes
             self._fractional = False
             self._box = None
-            displacement, shift = space.free()
+            displacement, _ = space.free()
             if self.verbose:
                 print("[SO3LR-JAXMD] Vacuum mode: using space.free(), box=None, disable_cell_list=True")
         else:
             # Periodic system: use fractional coordinates for NPT compatibility
             self._fractional = True
-            displacement, shift = space.periodic_general(
+            displacement, _ = space.periodic_general(
                 box=self._box, 
                 fractional_coordinates=self._fractional
             )
-        self._displacement = displacement
-        self._shift = shift
         
         # Get JAX-MD interface
         self._neighbor_fn, self._neighbor_fn_lr, self._energy_fn = to_jax_md(
@@ -212,168 +335,103 @@ class SO3LR_JAXMD_driver:
             buffer_size_multiplier_sr=self.buffer_size_multiplier_sr,
             buffer_size_multiplier_lr=self.buffer_size_multiplier_lr,
             fractional_coordinates=self._fractional,
-            disable_cell_list=self.vacuum,  # Disable for vacuum to avoid memory explosion
+            disable_cell_list=self.vacuum,
+            **self._extra_kwargs,
         )
         
-        # Create combined energy+force function via value_and_grad
-        # This computes both in a single forward+backward pass (optimal)
-        # Instead of calling energy_fn and force_fn separately (2 forward passes)
-        energy_fn_captured = self._energy_fn
-        
-        def energy_and_force(positions, **kwargs):
-            """Compute energy and forces in one pass using value_and_grad."""
-            # Negate energy for gradient (forces = -grad(E))
-            def neg_energy(R):
-                return -energy_fn_captured(R, **kwargs)
-            
-            neg_E, forces = jax.value_and_grad(neg_energy)(positions)
-            return -neg_E, forces  # Return positive energy
-        
-        self._energy_and_force_fn = energy_and_force
-        
-        # JIT-compile neighbor list update functions to avoid recompilation every step
-        # This is CRITICAL for performance - without JIT, the internal `cond` in update()
-        # causes ~0.5s recompilation overhead per neighbor list per step!
+        # JIT-compile batched neighbor list update functions
+        # vmap slices PyTree leaves so each mapped instance sees an unbatched
+        # NeighborList. Static fields (update_fn) remain shared.
         if self.vacuum:
-            # Vacuum mode: no box argument
-            @jax.jit
-            def update_nbrs_sr(nbrs, positions):
-                return nbrs.update(positions)
-            
-            @jax.jit
-            def update_nbrs_lr(nbrs, positions):
-                return nbrs.update(positions)
-            
-            # BATCHED UPDATE: vmap slices PyTree leaves so each mapped instance
-            # sees an unbatched NeighborList. Static fields (update_fn) remain shared.
-            self._update_sr_batched = jax.jit(
-                jax.vmap(lambda n, p: n.update(p), in_axes=(0, 0))
-            )
-            self._update_lr_batched = jax.jit(
-                jax.vmap(lambda n, p: n.update(p), in_axes=(0, 0))
-            )
+            self._update_sr_batched = jax.vmap(lambda n, p: n.update(p), in_axes=(0, 0))
+            self._update_lr_batched = jax.vmap(lambda n, p: n.update(p), in_axes=(0, 0))
         else:
-            # Periodic mode: box as argument
-            @jax.jit
-            def update_nbrs_sr(nbrs, positions, box):
-                return nbrs.update(positions, box=box)
-            
-            @jax.jit
-            def update_nbrs_lr(nbrs, positions, box):
-                return nbrs.update(positions, box=box)
-            
-            # BATCHED UPDATE: box is NOT vmapped (in_axes=None) since all beads share same box in NVT
-            self._update_sr_batched = jax.jit(
-                jax.vmap(lambda n, p, bx: n.update(p, box=bx), in_axes=(0, 0, None))
-            )
-            self._update_lr_batched = jax.jit(
-                jax.vmap(lambda n, p, bx: n.update(p, box=bx), in_axes=(0, 0, None))
-            )
-        
-        self._update_nbrs_sr = update_nbrs_sr
-        self._update_nbrs_lr = update_nbrs_lr
+            # box is NOT vmapped (in_axes=None) since all beads share same box in NVT
+            self._update_sr_batched = jax.vmap(lambda n, p, bx: n.update(p, box=bx), in_axes=(0, 0, None))
+            self._update_lr_batched = jax.vmap(lambda n, p, bx: n.update(p, box=bx), in_axes=(0, 0, None))
 
-        # ================================================================
+
         # Pre-create vmapped energy+force + fused update-and-compute kernel
-        #
-        # Why: the previous flow did
-        #   (1) vmapped neighbor update + host sync (overflow check)
-        #   (2) vmapped energy/force + host sync (device_get)
-        #
-        # By fusing update+compute we reduce dispatch count and avoid an
-        # extra synchronization on the common no-overflow path.
-        # ================================================================
         energy_fn_captured = self._energy_fn
-        is_vacuum = self.vacuum
 
-        if is_vacuum:
-            def energy_and_force_single_vacuum(pos, nbr, nbr_lr):
-                def neg_energy(R):
-                    return -energy_fn_captured(R, neighbor=nbr, neighbor_lr=nbr_lr, box=None)
+        def energy_and_force_single(pos, nbr, nbr_lr, box_arg):
+            def neg_energy(R):
+                return -energy_fn_captured(R, neighbor=nbr, neighbor_lr=nbr_lr, box=box_arg)
+            neg_E, forces = jax.value_and_grad(neg_energy)(pos)
+            return -neg_E, forces
 
-                neg_E, forces = jax.value_and_grad(neg_energy)(pos)
-                return -neg_E, forces
+        # box_arg is not vmapped (shared across beads, or None for vacuum)
+        self._vmapped_energy_and_force_fn = jax.vmap(
+            energy_and_force_single, in_axes=(0, 0, 0, None)
+        )
 
-            self._vmapped_energy_and_force_fn = jax.jit(
-                jax.vmap(energy_and_force_single_vacuum, in_axes=(0, 0, 0))
-            )
-
-            def update_and_compute(nbrs_batched, nbrs_lr_batched, stacked_pos):
+        def update_and_compute(nbrs_batched, nbrs_lr_batched, stacked_pos, box_arg):
+            if self.vacuum:
                 nbrs_batched = self._update_sr_batched(nbrs_batched, stacked_pos)
                 nbrs_lr_batched = self._update_lr_batched(nbrs_lr_batched, stacked_pos)
-                energies_ev, forces_ev_ang = self._vmapped_energy_and_force_fn(
-                    stacked_pos,
-                    nbrs_batched.idx,
-                    nbrs_lr_batched.idx,
-                )
-                overflow = jnp.any(nbrs_batched.did_buffer_overflow) | jnp.any(
-                    nbrs_lr_batched.did_buffer_overflow
-                )
-                return nbrs_batched, nbrs_lr_batched, energies_ev, forces_ev_ang, overflow
-
-            self._update_and_compute_batched = jax.jit(update_and_compute, donate_argnums=(0, 1))
-        else:
-            def energy_and_force_single_periodic(pos, nbr, nbr_lr, box_arg):
-                def neg_energy(R):
-                    return -energy_fn_captured(R, neighbor=nbr, neighbor_lr=nbr_lr, box=box_arg)
-
-                neg_E, forces = jax.value_and_grad(neg_energy)(pos)
-                return -neg_E, forces
-
-            self._vmapped_energy_and_force_fn = jax.jit(
-                jax.vmap(energy_and_force_single_periodic, in_axes=(0, 0, 0, None))
-            )
-
-            def update_and_compute(nbrs_batched, nbrs_lr_batched, stacked_pos, box_arg):
+            else:
                 nbrs_batched = self._update_sr_batched(nbrs_batched, stacked_pos, box_arg)
                 nbrs_lr_batched = self._update_lr_batched(nbrs_lr_batched, stacked_pos, box_arg)
-                energies_ev, forces_ev_ang = self._vmapped_energy_and_force_fn(
-                    stacked_pos,
-                    nbrs_batched.idx,
-                    nbrs_lr_batched.idx,
-                    box_arg,
-                )
-                overflow = jnp.any(nbrs_batched.did_buffer_overflow) | jnp.any(
-                    nbrs_lr_batched.did_buffer_overflow
-                )
-                return nbrs_batched, nbrs_lr_batched, energies_ev, forces_ev_ang, overflow
+            energies_ev, forces_ev_ang = self._vmapped_energy_and_force_fn(
+                stacked_pos, nbrs_batched.idx, nbrs_lr_batched.idx, box_arg,
+            )
+            overflow = jnp.any(nbrs_batched.did_buffer_overflow) | jnp.any(
+                nbrs_lr_batched.did_buffer_overflow
+            )
+            return nbrs_batched, nbrs_lr_batched, energies_ev, forces_ev_ang, overflow
 
-            self._update_and_compute_batched = jax.jit(update_and_compute, donate_argnums=(0, 1))
-        
-        self._initialized = True
+        self._update_and_compute_batched = jax.jit(update_and_compute, donate_argnums=(0, 1))
         
         if self.verbose:
             print(f"[SO3LR-JAXMD] Initialized with {self._n_atoms} atoms")
             print(f"[SO3LR-JAXMD] dtype={self.dtype_str}")
             print(f"[SO3LR-JAXMD] Devices: {jax.devices()}")
-    
-    def _get_positions(self, positions: np.ndarray, box: np.ndarray) -> jnp.ndarray:
-        """Get positions in the appropriate coordinate system.
-        
-        For periodic systems: convert to fractional coordinates.
-        For vacuum: return Cartesian coordinates directly.
-        """
-        if self.vacuum or box is None:
-            return positions  # Cartesian for vacuum
-        else:
-            inv_box = jnp.linalg.inv(box)
-            return jnp.dot(positions, inv_box)  # Fractional for PBC
-    
-    @staticmethod
-    @jax.jit
-    def _to_fractional_batched(pos_ang: jnp.ndarray, box_ang: jnp.ndarray) -> jnp.ndarray:
-        """Convert batched Cartesian positions to fractional coordinates.
+
+    def _run_fused_kernel(
+        self,
+        stacked_pos_frac: jnp.ndarray,
+        box_ang: jnp.ndarray | None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Run the fused update+compute kernel, handling overflow.
         
         Args:
-            pos_ang: (n_beads, n_atoms, 3) positions in Angstrom
-            box_ang: (3, 3) box matrix in Angstrom (shared across beads for NVT)
+            stacked_pos_frac: (n_beads, n_atoms, 3) fractional (or Cartesian for vacuum)
+            box_ang: (3, 3) box in Angstrom, or None for vacuum
         
         Returns:
-            (n_beads, n_atoms, 3) fractional coordinates
+            (energies_ev, forces_ev_ang) as NumPy arrays on host
         """
-        inv_box = jnp.linalg.inv(box_ang)
-        return jnp.einsum('bni,ij->bnj', pos_ang, inv_box)
+        energies_ev, forces_ev_ang, overflow = self._dispatch(stacked_pos_frac, box_ang)
+        
+        if bool(overflow):
+            self._handle_overflow(stacked_pos_frac, box_ang)
+            energies_ev, forces_ev_ang, overflow = self._dispatch(stacked_pos_frac, box_ang)
+            if bool(overflow):
+                raise RuntimeError("Neighbor list overflow persists after reallocation")
+        
+        return energies_ev, forces_ev_ang
     
+    def _dispatch(
+        self,
+        stacked_pos_frac: jnp.ndarray,
+        box_ang: jnp.ndarray | None,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Single dispatch of the fused kernel.
+        
+        Returns:
+            (energies_ev, forces_ev_ang, overflow) as NumPy arrays on host
+        """
+        (
+            self._nbrs_batched,
+            self._nbrs_lr_batched,
+            energies_ev,
+            forces_ev_ang,
+            overflow,
+        ) = self._update_and_compute_batched(
+            self._nbrs_batched, self._nbrs_lr_batched, stacked_pos_frac, box_ang
+        )
+        return jax.device_get((energies_ev, forces_ev_ang, overflow))
+
     def _ensure_neighbor_lists(
         self, 
         stacked_pos_frac: jnp.ndarray,  # (n_beads, n_atoms, 3) fractional coords
@@ -408,24 +466,15 @@ class SO3LR_JAXMD_driver:
             def stack_pytree(pytree_list):
                 return jax.tree_util.tree_map(lambda *xs: jnp.stack(xs, axis=0), *pytree_list)
 
-            if self.vacuum:
-                nbrs_list = [
-                    self._neighbor_fn.allocate(ref_pos_frac, extra_capacity=0)
-                    for _ in range(n_beads)
-                ]
-                nbrs_lr_list = [
-                    self._neighbor_fn_lr.allocate(ref_pos_frac, extra_capacity=0)
-                    for _ in range(n_beads)
-                ]
-            else:
-                nbrs_list = [
-                    self._neighbor_fn.allocate(ref_pos_frac, box=box_ang, extra_capacity=0)
-                    for _ in range(n_beads)
-                ]
-                nbrs_lr_list = [
-                    self._neighbor_fn_lr.allocate(ref_pos_frac, box=box_ang, extra_capacity=0)
-                    for _ in range(n_beads)
-                ]
+            box_kwargs = {} if self.vacuum else {"box": box_ang}
+            nbrs_list = [
+                self._neighbor_fn.allocate(ref_pos_frac, extra_capacity=0, **box_kwargs)
+                for _ in range(n_beads)
+            ]
+            nbrs_lr_list = [
+                self._neighbor_fn_lr.allocate(ref_pos_frac, extra_capacity=0, **box_kwargs)
+                for _ in range(n_beads)
+            ]
 
             self._nbrs_batched = stack_pytree(nbrs_list)
             self._nbrs_lr_batched = stack_pytree(nbrs_lr_list)
@@ -439,311 +488,29 @@ class SO3LR_JAXMD_driver:
     def _handle_overflow(
         self, 
         stacked_pos_frac: jnp.ndarray,  # (n_beads, n_atoms, 3) fractional coords
-        box_ang: jnp.ndarray,           # (3, 3) box in Angstrom, or None for vacuum
-    ):
+        box_ang: jnp.ndarray | None,    # (3, 3) box in Angstrom, or None for vacuum
+    ) -> None:
         """Reallocate neighbor lists after overflow with increased uniform capacity."""
-        if self.verbose:
-            print("[SO3LR-JAXMD] Neighbor list overflow, reallocating with increased capacity...")
+        print("[SO3LR-JAXMD] Neighbor list overflow, reallocating with increased capacity...")
         
         # Force reallocation by clearing the cached batched neighbor lists
         self._nbrs_batched = None
         self._nbrs_lr_batched = None
-        self._n_beads_cached = 0
         
         # Reallocate - _ensure_neighbor_lists will handle uniform allocation
         self._ensure_neighbor_lists(stacked_pos_frac, box_ang)
-    
-    def __call__(
-        self,
-        cell,  # Can be np.ndarray (single) or List[np.ndarray] (batch)
-        pos,   # Can be np.ndarray (single) or List[np.ndarray] (batch)
-    ):
-        """Unified interface for single or batched evaluation.
-        
-        This method handles both:
-        - Single structure: cell is (3,3) array, pos is (n_atoms, 3) array
-        - Batch of structures: cell is list of (3,3) arrays, pos is list of (n_atoms, 3) arrays
-        
-        FFDirect calls this with lists when batch_size > 1.
-        
-        Returns:
-            Single: (energy, forces, stress, extras) tuple
-            Batch: List of (energy, forces, stress, extras) tuples
-        """
-        # Detect if we're in batch mode (FFDirect passes lists when batch_size > 1)
-        if isinstance(cell, list):
-            # Batch mode - route to compute_batch
-            return self.compute_batch(cell, pos)
-        
-        # Single structure mode - original __call__ logic
-        self.eval_count += 1
-        
-        diagnostics = self.verbose and (self.eval_count % 100 == 0)
-        
-        if diagnostics:
-            start = time.perf_counter()
-            t0 = start
-        
-        pos_ang_np = np.asarray(pos, dtype=self.dtype).reshape(-1, 3) * self._bohr_to_ang
-        stacked_pos_ang = jax.device_put(pos_ang_np[None, ...])
 
-        # For vacuum mode, use box=None; otherwise convert cell
-        if self.vacuum:
-            box_ang = None
-            stacked_pos_frac = stacked_pos_ang  # Cartesian for vacuum
-        else:
-            box_ang_np = np.asarray(cell, dtype=self.dtype) * self._bohr_to_ang
-            box_ang = jax.device_put(box_ang_np)
-            stacked_pos_frac = self._to_fractional_batched(stacked_pos_ang, box_ang)
-        
-        if diagnostics:
-            jax.block_until_ready(stacked_pos_frac)
-            t_convert = time.perf_counter() - t0
-            t0 = time.perf_counter()
-        
-        # Ensure neighbor lists
-        self._ensure_neighbor_lists(stacked_pos_frac, box_ang)
-
-        if diagnostics:
-            # Neighbor list update is now fused into the compute dispatch
-            t_nbrs = 0.0
-            t0 = time.perf_counter()
-        
-        # Update neighbor lists + compute energy/forces in a single dispatch
-        if self.vacuum:
-            (
-                self._nbrs_batched,
-                self._nbrs_lr_batched,
-                energies_ev,
-                forces_ev_ang,
-                overflow,
-            ) = self._update_and_compute_batched(
-                self._nbrs_batched,
-                self._nbrs_lr_batched,
-                stacked_pos_frac,
-            )
-        else:
-            (
-                self._nbrs_batched,
-                self._nbrs_lr_batched,
-                energies_ev,
-                forces_ev_ang,
-                overflow,
-            ) = self._update_and_compute_batched(
-                self._nbrs_batched,
-                self._nbrs_lr_batched,
-                stacked_pos_frac,
-                box_ang,
-            )
-
-        energies_ev, forces_ev_ang, overflow = jax.device_get((energies_ev, forces_ev_ang, overflow))
-        if bool(overflow):
-            self._handle_overflow(stacked_pos_frac, box_ang)
-            self._ensure_neighbor_lists(stacked_pos_frac, box_ang)
-            if self.vacuum:
-                (
-                    self._nbrs_batched,
-                    self._nbrs_lr_batched,
-                    energies_ev,
-                    forces_ev_ang,
-                    overflow,
-                ) = self._update_and_compute_batched(
-                    self._nbrs_batched,
-                    self._nbrs_lr_batched,
-                    stacked_pos_frac,
-                )
-            else:
-                (
-                    self._nbrs_batched,
-                    self._nbrs_lr_batched,
-                    energies_ev,
-                    forces_ev_ang,
-                    overflow,
-                ) = self._update_and_compute_batched(
-                    self._nbrs_batched,
-                    self._nbrs_lr_batched,
-                    stacked_pos_frac,
-                    box_ang,
-                )
-            energies_ev, forces_ev_ang, overflow = jax.device_get((energies_ev, forces_ev_ang, overflow))
-            if bool(overflow):
-                raise RuntimeError("Neighbor list overflow persists after reallocation")
-        
-        # Convert units: eV -> Hartree, eV/Angstrom -> Hartree/Bohr
-        energy = float(energies_ev[0] * self._ev_to_hartree)
-        forces = np.asarray(forces_ev_ang[0]) * self._ev_to_hartree * self._bohr_to_ang
-        
-        if diagnostics:
-            t_compute = time.perf_counter() - t0
-            elapsed = time.perf_counter() - start
-            print(f"[SO3LR-JAXMD] Eval #{self.eval_count}: {elapsed:.4f}s (convert={t_convert:.4f}s, nbrs={t_nbrs:.4f}s, compute={t_compute:.4f}s)")
-        
-        # Return in i-PI format
-        stress = np.zeros((3, 3), dtype=self.dtype)
-        return energy, forces.ravel(), stress, self._empty_json
-    
-    def compute_batch(
-        self,
-        cell_list: List[np.ndarray],
-        pos_list: List[np.ndarray],
-    ) -> List[Tuple[float, np.ndarray, np.ndarray, str]]:
-        """Batched evaluation for PIMD beads using vmap.
-        
-        This method uses jax.vmap to compute energies and forces for all
-        beads in parallel on the GPU, providing significant speedup over
-        sequential computation.
-        
-        Optimizations applied:
-        - Stack all positions on CPU, single device_put (reduces N transfers to 1)
-        - Compute fractional coordinates once and reuse
-        - Use block_until_ready for accurate timing
+    @staticmethod
+    @jax.jit
+    def _to_fractional_batched(pos_ang: jnp.ndarray, box_ang: jnp.ndarray) -> jnp.ndarray:
+        """Convert batched Cartesian positions to fractional coordinates.
         
         Args:
-            cell_list: List of (3, 3) cell matrices in Bohr
-            pos_list: List of (n_atoms, 3) positions in Bohr
+            pos_ang: (n_beads, n_atoms, 3) positions in Angstrom
+            box_ang: (3, 3) box matrix in Angstrom (shared across beads for NVT)
         
         Returns:
-            List of (energy, forces, stress, extras) tuples
+            (n_beads, n_atoms, 3) fractional coordinates
         """
-        self.eval_count += 1
-        n_beads = len(pos_list)
-        
-        diagnostics = self.verbose and (self.eval_count % 100 == 0)
-        
-        if diagnostics:
-            print(f"[SO3LR-JAXMD] Batch #{self.eval_count}: {n_beads} beads (vmapped)")
-            start = time.perf_counter()
-            t0 = start
-        
-        # Pre-allocate stresses
-        if self._zero_stresses is None or self._zero_stresses.shape[0] != n_beads:
-            self._zero_stresses = np.zeros((n_beads, 3, 3), dtype=self.dtype)
-        
-        # ==============================================
-        # OPTIMIZATION 1: Stack on CPU, single device_put
-        # ==============================================
-        # Stack all positions on CPU first (avoids N separate jnp.array calls)
-        # OPTIMIZATION: Use np.asarray + reshape to avoid Python loop in list comprehension
-        # This handles both flat (3N,) and structured (N,3) inputs efficiently
-        pos_arr = np.asarray(pos_list, dtype=self.dtype)
-        pos_stacked_np = pos_arr.reshape(n_beads, self._n_atoms, 3) * self._bohr_to_ang
-
-        # Single transfer to GPU (already correct dtype)
-        stacked_pos_ang = jax.device_put(pos_stacked_np)
-        
-        # For vacuum mode, use box=None; otherwise convert cell (NVT: single box)
-        if self.vacuum:
-            box_ang = None
-            stacked_pos_frac = stacked_pos_ang  # Cartesian coords for vacuum
-        else:
-            # NVT: all beads share the same box, use first cell
-            box_np = np.asarray(cell_list[0], dtype=self.dtype) * self._bohr_to_ang
-            box_ang = jax.device_put(box_np)
-            
-            # ==============================================
-            # OPTIMIZATION 2: Compute fractional coords ONCE
-            # ==============================================
-            stacked_pos_frac = self._to_fractional_batched(stacked_pos_ang, box_ang)
-        
-        if diagnostics:
-            jax.block_until_ready(stacked_pos_frac)
-            t_convert = time.perf_counter() - t0
-            t0 = time.perf_counter()
-        
-        # ==============================================
-        # Neighbor list update (with overflow handling)
-        # ==============================================
-        self._ensure_neighbor_lists(stacked_pos_frac, box_ang)
-
-        if diagnostics:
-            # Neighbor list update is now fused into the compute dispatch
-            t_nbrs = 0.0
-            t0 = time.perf_counter()
-        
-        # ==============================================
-        # Compute energy/forces for all beads via vmap
-        # ==============================================
-        # Update neighbor lists + compute energy/forces in a single dispatch
-        if self.vacuum:
-            (
-                self._nbrs_batched,
-                self._nbrs_lr_batched,
-                energies_ev,
-                forces_ev_ang,
-                overflow,
-            ) = self._update_and_compute_batched(
-                self._nbrs_batched,
-                self._nbrs_lr_batched,
-                stacked_pos_frac,
-            )
-        else:
-            (
-                self._nbrs_batched,
-                self._nbrs_lr_batched,
-                energies_ev,
-                forces_ev_ang,
-                overflow,
-            ) = self._update_and_compute_batched(
-                self._nbrs_batched,
-                self._nbrs_lr_batched,
-                stacked_pos_frac,
-                box_ang,
-            )
-
-        energies_ev, forces_ev_ang, overflow = jax.device_get((energies_ev, forces_ev_ang, overflow))
-        if bool(overflow):
-            self._handle_overflow(stacked_pos_frac, box_ang)
-            self._ensure_neighbor_lists(stacked_pos_frac, box_ang)
-            if self.vacuum:
-                (
-                    self._nbrs_batched,
-                    self._nbrs_lr_batched,
-                    energies_ev,
-                    forces_ev_ang,
-                    overflow,
-                ) = self._update_and_compute_batched(
-                    self._nbrs_batched,
-                    self._nbrs_lr_batched,
-                    stacked_pos_frac,
-                )
-            else:
-                (
-                    self._nbrs_batched,
-                    self._nbrs_lr_batched,
-                    energies_ev,
-                    forces_ev_ang,
-                    overflow,
-                ) = self._update_and_compute_batched(
-                    self._nbrs_batched,
-                    self._nbrs_lr_batched,
-                    stacked_pos_frac,
-                    box_ang,
-                )
-            energies_ev, forces_ev_ang, overflow = jax.device_get((energies_ev, forces_ev_ang, overflow))
-            if bool(overflow):
-                raise RuntimeError("Neighbor list overflow persists after reallocation")
-
-        # Convert units: eV -> Hartree, eV/Angstrom -> Hartree/Bohr
-        energies = energies_ev * self._ev_to_hartree
-        forces = forces_ev_ang * self._ev_to_hartree * self._bohr_to_ang
-        
-        # Format results
-        results = [
-            (
-                float(energies[i]),
-                forces[i].ravel(),
-                self._zero_stresses[i],
-                self._empty_json,
-            )
-            for i in range(n_beads)
-        ]
-        
-        if diagnostics:
-            t_compute = time.perf_counter() - t0
-            elapsed = time.perf_counter() - start
-            print(f"[SO3LR-JAXMD] Total: {elapsed:.3f}s ({elapsed/n_beads:.4f}s/bead)")
-            print(f"[SO3LR-JAXMD]   - Convert: {t_convert:.3f}s")
-            print(f"[SO3LR-JAXMD]   - NbrList: {t_nbrs:.3f}s")
-            print(f"[SO3LR-JAXMD]   - Compute: {t_compute:.3f}s")
-        
-        return results
+        inv_box = jnp.linalg.inv(box_ang)
+        return jnp.einsum('bni,ij->bnj', pos_ang, inv_box)
