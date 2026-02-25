@@ -117,37 +117,45 @@ def build_fused_kernel(
 
     def create_energy_force_single(compute_observables: bool):
         def energy_force_single(pos, nbr, nbr_lr, box_arg):
-            def neg_energy(R, perturbation=None):
+            def neg_energy_with_eps(R, eps):
                 kwargs = {"neighbor": nbr, "neighbor_lr": nbr_lr, "box": box_arg}
-                if perturbation is not None:
-                    kwargs["perturbation"] = perturbation
+                dim = R.shape[-1]
+                kwargs["perturbation"] = jnp.eye(dim, dtype=R.dtype) + eps
+                
+                if compute_observables:
+                    energy_atoms, aux = energy_fn(R, has_aux=True, **kwargs)
+                    return -jnp.sum(energy_atoms), _extract_observables(aux, R.dtype)
+                return -energy_fn(R, **kwargs)
+
+            def neg_energy_no_eps(R):
+                kwargs = {"neighbor": nbr, "neighbor_lr": nbr_lr, "box": box_arg}
                 if compute_observables:
                     energy_atoms, aux = energy_fn(R, has_aux=True, **kwargs)
                     return -jnp.sum(energy_atoms), _extract_observables(aux, R.dtype)
                 return -energy_fn(R, **kwargs)
 
             if compute_stress:
-                eps0 = jnp.eye(3, dtype=pos.dtype)
+                dim = pos.shape[-1]
+                zero_eps = jnp.zeros((dim, dim), dtype=pos.dtype)
+                
                 if compute_observables:
-                    (
-                        neg_energy_ev,
-                        (dipole_vec, hirshfeld),
-                    ), (forces_ev_ang, neg_virial_ev) = jax.value_and_grad(
-                        neg_energy, argnums=(0, 1), has_aux=True
-                    )(pos, eps0)
+                    (neg_energy_ev, (dipole_vec, hirshfeld)), (forces_ev_ang, virials_ev) = (
+                        jax.value_and_grad(neg_energy_with_eps, argnums=(0, 1), has_aux=True)(pos, zero_eps)
+                    )
                 else:
-                    neg_energy_ev, (forces_ev_ang, neg_virial_ev) = jax.value_and_grad(
-                        neg_energy, argnums=(0, 1)
-                    )(pos, eps0)
+                    neg_energy_ev, (forces_ev_ang, virials_ev) = (
+                        jax.value_and_grad(neg_energy_with_eps, argnums=(0, 1))(pos, zero_eps)
+                    )
                     dipole_vec, hirshfeld = empty_vec, empty_vec
-                virials_ev = 0.5 * (neg_virial_ev + neg_virial_ev.T)
+                
+                virials_ev = 0.5 * (virials_ev + virials_ev.T)
             else:
                 if compute_observables:
                     (neg_energy_ev, (dipole_vec, hirshfeld)), forces_ev_ang = (
-                        jax.value_and_grad(neg_energy, has_aux=True)(pos)
+                        jax.value_and_grad(neg_energy_no_eps, has_aux=True)(pos)
                     )
                 else:
-                    neg_energy_ev, forces_ev_ang = jax.value_and_grad(neg_energy)(pos)
+                    neg_energy_ev, forces_ev_ang = jax.value_and_grad(neg_energy_no_eps)(pos)
                     dipole_vec, hirshfeld = empty_vec, empty_vec
                 virials_ev = empty_virial
 
