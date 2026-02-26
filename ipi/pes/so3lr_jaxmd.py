@@ -213,8 +213,7 @@ class SO3LR_JAXMD_driver:
         jdtype = jnp.float32 if dtype_str == "float32" else jnp.float64
 
         # Unit conversion scalars (JAX arrays, live on GPU).
-        # Captured by the JIT kernel closure so conversions are fused
-        # into the compiled program with zero dispatch overhead.
+        # Captured by the JIT kernel closure so conversions are fused.
         # i-PI: Bohr, Hartree  ↔  SO3LR/JAX-MD: Angstrom, eV
         self._bohr_to_ang = jnp.array(Bohr / Angstrom, dtype=jdtype)
         bohr_to_ang = self._bohr_to_ang
