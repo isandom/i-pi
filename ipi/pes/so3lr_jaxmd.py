@@ -239,9 +239,11 @@ class SO3LR_JAXMD_driver:
         
         from so3lr import to_jax_md, So3lrPotential
         
+        quantities = ['nn_energy', 'electrostatic_energy', 'dispersion_energy', 'partial_charges', 'zbl_repulsion'] if self.output_observables else []
         potential = So3lrPotential(
             dtype=jdtype,
             lr_cutoff=lr_cutoff,
+            output_intermediate_quantities=quantities
         )
         
         if self.verbose:
@@ -301,7 +303,6 @@ class SO3LR_JAXMD_driver:
             bohr_to_ang=bohr_to_ang,
             ev_to_hartree=ev_to_hartree,
             ev_ang_to_hartree_bohr=ev_ang_to_hartree_bohr,
-            n_atoms=self._n_atoms,
             dtype=jdtype,
         )
         
@@ -415,8 +416,15 @@ class SO3LR_JAXMD_driver:
         return json.dumps({
             "mu": np.asarray(results["mu"]).reshape(3).tolist(),
             "mu2": np.asarray(results["mu2"]).reshape(3).tolist(),
+            "mu_mag": float(results["mu_mag"]),
             "h": np.asarray(results["h"]).reshape(-1).tolist(),
             "h2": np.asarray(results["h2"]).reshape(-1).tolist(),
+            "q": np.asarray(results["q"]).reshape(-1).tolist(),
+            "q2": np.asarray(results["q2"]).reshape(-1).tolist(),
+            "E_elec": float(results["E_elec"]),
+            "E_disp": float(results["E_disp"]),
+            "E_so3k": float(results["E_so3k"]),
+            "E_zbl": float(results["E_zbl"]),
         })
     
     def _allocate_neighbor_lists(
@@ -518,7 +526,6 @@ def _build_fused_kernel(
     bohr_to_ang: jax.Array,
     ev_to_hartree: jax.Array,
     ev_ang_to_hartree_bohr: jax.Array,
-    n_atoms: int,
     dtype: jnp.dtype,
 ) -> Callable:
     """Create the fused update+compute kernel with fixed feature flags."""
@@ -535,7 +542,7 @@ def _build_fused_kernel(
             energy_atoms, aux = energy_fn(R, has_aux=True, **kwargs)
             return -jnp.sum(energy_atoms), _extract_observables(aux)
         else:
-            dummy_aux = (empty_vec, empty_vec)
+            dummy_aux = (empty_vec, empty_vec, empty_vec, empty_vec, empty_vec, empty_vec, empty_vec)
             return -energy_fn(R, **kwargs), dummy_aux
 
     argnums = (0, 4) if compute_stress else 0
@@ -545,12 +552,12 @@ def _build_fused_kernel(
         if compute_stress:
             dim = pos.shape[-1]
             zero_eps = jnp.zeros((dim, dim), dtype=pos.dtype)
-            (neg_energy_ev, (dip_vec, hirsh)), (forces_ev_ang, virials_ev) = grad_fn(
+            (neg_energy_ev, (dip_vec, hirsh, charges, e_elec, e_disp, e_so3k, e_zbl)), (forces_ev_ang, virials_ev) = grad_fn(
                 pos, nbr, nbr_lr, box_arg, zero_eps, compute_observables
             )
             virials_ev = 0.5 * (virials_ev + virials_ev.T)
         else:
-            (neg_energy_ev, (dip_vec, hirsh)), forces_ev_ang = grad_fn(
+            (neg_energy_ev, (dip_vec, hirsh, charges, e_elec, e_disp, e_so3k, e_zbl)), forces_ev_ang = grad_fn(
                 pos, nbr, nbr_lr, box_arg, None, compute_observables
             )
             virials_ev = empty_virial
@@ -561,6 +568,11 @@ def _build_fused_kernel(
             "virials_ev": virials_ev,
             "dipole_vec": dip_vec,
             "hirshfeld": hirsh,
+            "partial_charges": charges,
+            "electrostatic_energy": e_elec,
+            "dispersion_energy": e_disp,
+            "nn_energy": e_so3k,
+            "zbl_repulsion": e_zbl,
         }
 
     def update_and_compute(
@@ -588,9 +600,14 @@ def _build_fused_kernel(
         )
 
         if compute_observables:
-            mu, mu2, h, h2 = _observable_moments(results["dipole_vec"], results["hirshfeld"])
+            mu, mu2, mu_mag, h, h2, q, q2, e_elec, e_disp, e_so3k, e_zbl = _observable_moments(
+                results["dipole_vec"], results["hirshfeld"], results["partial_charges"],
+                results["electrostatic_energy"], results["dispersion_energy"], results["nn_energy"], results["zbl_repulsion"]
+            )
         else:
-            mu, mu2, h, h2 = empty_vec, empty_vec, empty_vec, empty_vec
+            mu, mu2, h, h2, q, q2 = empty_vec, empty_vec, empty_vec, empty_vec, empty_vec, empty_vec
+            mu_mag = 0.0
+            e_elec, e_disp, e_so3k, e_zbl = 0.0, 0.0, 0.0, 0.0
 
         virials_hartree = (
             results["virials_ev"] * ev_to_hartree if compute_stress else empty_virial
@@ -606,8 +623,15 @@ def _build_fused_kernel(
             "virials_hartree": virials_hartree,
             "mu": mu,
             "mu2": mu2,
+            "mu_mag": mu_mag,
             "h": h,
             "h2": h2,
+            "q": q,
+            "q2": q2,
+            "E_elec": e_elec * ev_to_hartree,
+            "E_disp": e_disp * ev_to_hartree,
+            "E_so3k": e_so3k * ev_to_hartree,
+            "E_zbl": e_zbl * ev_to_hartree,
             "overflow": overflow,
         }
         return state, results
@@ -633,13 +657,20 @@ def _to_fractional_if_periodic(
 
 
 def _extract_observables(aux: dict):
-    return aux["dipole_vec"], aux["hirshfeld_ratios"]
+    return aux["dipole_vec"], aux["hirshfeld_ratios"], aux["partial_charges"], aux["electrostatic_energy"], aux["dispersion_energy"], aux["nn_energy"], aux["zbl_repulsion"]
 
 
-def _observable_moments(dipoles, hirshfeld):
+def _observable_moments(dipoles, hirshfeld, charges, elec, disp, so3k, zbl):
     return (
         jnp.mean(dipoles, axis=0),
         jnp.mean(dipoles**2, axis=0),
+        jnp.mean(jnp.linalg.norm(dipoles, axis=1)),
         jnp.mean(hirshfeld, axis=0),
-        jnp.mean(hirshfeld**2, axis=0)
+        jnp.mean(hirshfeld**2, axis=0),
+        jnp.mean(charges, axis=0),
+        jnp.mean(charges**2, axis=0),
+        jnp.mean(jnp.sum(elec, axis=-1), axis=0),
+        jnp.mean(jnp.sum(disp, axis=-1), axis=0),
+        jnp.mean(jnp.sum(so3k, axis=-1), axis=0),
+        jnp.mean(jnp.sum(zbl, axis=-1), axis=0),
     )
