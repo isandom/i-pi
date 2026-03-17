@@ -70,6 +70,14 @@ class InputTemperatureRamp(InputDictionary):
             InputValue,
             {"dtype": int, "default": 0, "help": "Current step along the ramp"},
         ),
+        "wait_steps": (
+            InputValue,
+            {
+                "dtype": int,
+                "default": 0,
+                "help": "Number of initial steps to wait before starting the ramp",
+            },
+        ),
     }
 
     default_help = """TemperatureRamp Motion class. It just updates the ensemble
@@ -86,6 +94,7 @@ class InputTemperatureRamp(InputDictionary):
         self.logscale.store(ramp.logscale)
         self.total_steps.store(ramp.total_steps)
         self.current_step.store(ramp.current_step)
+        self.wait_steps.store(ramp.wait_steps)
 
     def fetch(self):
         rv = super(InputTemperatureRamp, self).fetch()
@@ -134,6 +143,14 @@ class InputPressureRamp(InputDictionary):
             InputValue,
             {"dtype": int, "default": 0, "help": "Current step along the ramp"},
         ),
+        "wait_steps": (
+            InputValue,
+            {
+                "dtype": int,
+                "default": 0,
+                "help": "Number of initial steps to wait before starting the ramp",
+            },
+        ),
     }
 
     default_help = """PressureRamp Motion class. It just updates the ensemble
@@ -151,6 +168,7 @@ class InputPressureRamp(InputDictionary):
         self.logscale.store(ramp.logscale)
         self.total_steps.store(ramp.total_steps)
         self.current_step.store(ramp.current_step)
+        self.wait_steps.store(ramp.wait_steps)
 
     def fetch(self):
         rv = super(InputPressureRamp, self).fetch()
