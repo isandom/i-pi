@@ -143,7 +143,8 @@ def read_trajectory(
         # should already be in ASE format, just read and return
         return ase.io.read(filename, ":", format="extxyz")
 
-    file_handle = open(filename, "r")
+    open_mode = "rb" if format == "binary" else "r"
+    file_handle = open(filename, open_mode)
     comment_regex = re.compile(r"(\w+)\{([^}]+)\}")
     step_regex = re.compile(r"Step:\s+(\d+)")
 
