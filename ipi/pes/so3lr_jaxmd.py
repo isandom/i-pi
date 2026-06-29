@@ -428,43 +428,54 @@ class SO3LR_JAXMD_driver:
         })
     
     def _allocate_neighbor_lists(
-        self, 
+        self,
         stacked_pos_bohr: jax.Array,
         box_bohr: jax.Array | None,
+        allocate_sr: bool = True,
+        allocate_lr: bool = True,
     ) -> None:
         """Allocate neighbor lists for all PIMD beads.
-        
+
         JAX-MD's allocate() examines the provided positions, counts the actual
         neighbors within the cutoff, and then scales by capacity_multiplier.
+
+        Args:
+            allocate_sr: Allocate (or re-allocate) the short-range neighbor list.
+            allocate_lr: Allocate (or re-allocate) the long-range neighbor list.
         """
-        
+
         stacked_pos, box_ang = _to_fractional_if_periodic(
             stacked_pos_bohr, box_bohr, self._bohr_to_ang, self.vacuum
         )
-            
+
         n_beads = stacked_pos.shape[0]
-        
+
         # Use first bead's position as reference for allocation
         ref_pos = stacked_pos[0]
-        
+
         if self.verbose:
-            print(f"[SO3LR-JAXMD] Allocating neighbor lists for {n_beads} beads...")
+            which = [name for flag, name in [(allocate_sr, "SR"), (allocate_lr, "LR")] if flag]
+            print(f"[SO3LR-JAXMD] Allocating {'+'.join(which)} neighbor lists for {n_beads} beads...")
 
         def stack_pytree(pytree, copies):
             return jax.tree.map(lambda x: jnp.stack([x] * copies), pytree)
 
         box_kwargs = {} if self.vacuum else {"box": jnp.asarray(box_ang)}
-        
-        # Allocate once, then stack N copies of the dynamic leaves.
-        nbrs = self._neighbor_fn.allocate(ref_pos, extra_capacity=0, **box_kwargs)
-        nbrs_lr = self._neighbor_fn_lr.allocate(ref_pos, extra_capacity=0, **box_kwargs)
 
-        self._nbrs_batched = stack_pytree(nbrs, n_beads)
-        self._nbrs_lr_batched = stack_pytree(nbrs_lr, n_beads)
-        
+        # Allocate once per requested list, then stack N copies of the dynamic leaves.
+        if allocate_sr:
+            nbrs = self._neighbor_fn.allocate(ref_pos, extra_capacity=0, **box_kwargs)
+            self._nbrs_batched = stack_pytree(nbrs, n_beads)
+
+        if allocate_lr:
+            nbrs_lr = self._neighbor_fn_lr.allocate(ref_pos, extra_capacity=0, **box_kwargs)
+            self._nbrs_lr_batched = stack_pytree(nbrs_lr, n_beads)
+
         if self.verbose:
-            print(f"[SO3LR-JAXMD] Stacked neighbor lists: "
-                  f"idx={self._nbrs_batched.idx.shape}, idx_lr={self._nbrs_lr_batched.idx.shape}")
+            if allocate_sr:
+                print(f"[SO3LR-JAXMD] SR neighbor list: idx={self._nbrs_batched.idx.shape}")
+            if allocate_lr:
+                print(f"[SO3LR-JAXMD] LR neighbor list: idx_lr={self._nbrs_lr_batched.idx.shape}")
 
 
     def _update_neighbors_and_compute(
@@ -501,14 +512,23 @@ class SO3LR_JAXMD_driver:
             return jax.device_get(results)
 
         kernel_output = dispatch()
-        if bool(kernel_output["overflow"]):
-            print("[SO3LR-JAXMD] Neighbor list overflow, reallocating with increased capacity...")
-            self._nbrs_batched = None
-            self._nbrs_lr_batched = None
-            self._allocate_neighbor_lists(stacked_pos_bohr, box_bohr)
+        overflow_sr = bool(kernel_output["overflow_sr"])
+        overflow_lr = bool(kernel_output["overflow_lr"])
+        if overflow_sr or overflow_lr:
+            labels = [name for flag, name in [(overflow_sr, "SR"), (overflow_lr, "LR")] if flag]
+            print(f"[SO3LR-JAXMD] {'+'.join(labels)} neighbor list overflow, reallocating...")
+            if overflow_sr:
+                self._nbrs_batched = None
+            if overflow_lr:
+                self._nbrs_lr_batched = None
+            self._allocate_neighbor_lists(
+                stacked_pos_bohr, box_bohr,
+                allocate_sr=overflow_sr,
+                allocate_lr=overflow_lr,
+            )
             print("[SO3LR-JAXMD] Re-triggering JIT compilation due to new buffer shapes. This may take a minute...")
             kernel_output = dispatch()
-            if bool(kernel_output["overflow"]):
+            if bool(kernel_output["overflow_sr"]) or bool(kernel_output["overflow_lr"]):
                 raise RuntimeError("Neighbor list overflow persists after reallocation")
 
         return kernel_output
@@ -585,9 +605,8 @@ def _build_fused_kernel(
         nbrs_batched = update_sr_batched(nbrs_batched, stacked_pos, box_ang)
         nbrs_lr_batched = update_lr_batched(nbrs_lr_batched, stacked_pos, box_ang)
 
-        overflow = jnp.any(nbrs_batched.did_buffer_overflow) | jnp.any(
-            nbrs_lr_batched.did_buffer_overflow
-        )
+        overflow_sr = jnp.any(nbrs_batched.did_buffer_overflow)
+        overflow_lr = jnp.any(nbrs_lr_batched.did_buffer_overflow)
 
         vmapped_energy_and_force_fn = jax.vmap(
             lambda p, n_idx, n_lr_idx, bx: energy_force_single(
@@ -632,7 +651,8 @@ def _build_fused_kernel(
             "E_disp": e_disp * ev_to_hartree,
             "E_so3k": e_so3k * ev_to_hartree,
             "E_zbl": e_zbl * ev_to_hartree,
-            "overflow": overflow,
+            "overflow_sr": overflow_sr,
+            "overflow_lr": overflow_lr,
         }
         return state, results
 
